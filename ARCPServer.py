@@ -125,53 +125,68 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             continue
 
         # DIRECT MESSAGING LOGIC (/sendmsg)
-        if full_message.startswith("DM:"):
-            parts = full_message.split(":", 2)
+        parts = full_message.split(" ", 2)
 
-            if len(parts) < 2:
+        if len(parts) < 2:
+            send_framed_msg(client_socket, "ERROR: Invalid message format.", 'COMMAND')
+            continue
+
+        command = parts[0]
+        recipient = parts[1]
+        data = parts[2] if len(parts) > 2 else ""
+
+        if command == "SEND":
+            # Case 1: Recipient is an online user
+            peer = ChatServer.get_peer_info(recipient)
+
+            if peer:
+                sock = peer[0]
+                send_framed_msg(sock, f"{username}: {data}", 'DATA')
                 continue
 
-            command = parts[0]
-            recipient = parts[1]
-            data = parts[2] if len(parts) > 2 else ""
-
-            if command == "SEND":
-                # Case 1: Recipient is an online user
-                peer = ChatServer.get_peer_info(recipient)
-
-                if peer:
-                    sock = peer[0]
-                    send_framed_msg(sock, f"{username}: {data}", 'DATA')
-                    continue
-
-                # Case 2: Recipient is a group
-                success = ChatServer.send_group_message(username, recipient, data, send_framed_msg)
-                if success:
-                    continue
-
-                # Case 3: Recipient is offline user -> Queue in Redis
-                with db_lock:
-                    if recipient not in redis_message_queue:
-                        redis_message_queue[recipient] = []
-                    redis_message_queue[recipient].append((username, data))
-
-            if command == "CREATE_GROUP":
-                created = ChatServer.create_group(recipient, username)
-                msg = "GROUP CREATED" if created else "GROUP_EXISTS"
-                send_framed_msg(client_socket, msg, 'COMMAND')
+            # Case 2: Recipient is a group
+            sent_to_group = ChatServer.send_group_message(username, recipient, data, send_framed_msg)
+            if sent_to_group:
                 continue
 
-            if command == "JOIN_GROUP":
-                joined = ChatServer.join_group(recipient, username)
-                msg = "JOINED_GROUP" if joined else "GROUP_NOT_FOUND"
-                send_framed_msg(client_socket, msg, 'COMMAND')
-                continue
+            # Case 3: Recipient is offline user -> Queue in Redis
+            with db_lock:
+                if recipient not in redis_message_queue:
+                    redis_message_queue[recipient] = []
+                redis_message_queue[recipient].append((username, data))
 
-            if command == "LEAVE_GROUP":
-                left = ChatServer.leave_group(recipient, username)
-                msg = "LEFT_GROUP" if left else "GROUP_NOT_FOUND_OR_NOT_MEMBER"
-                send_framed_msg(client_socket, msg, 'COMMAND')
-                continue
+            send_framed_msg(client_socket, "QUEUED_OFFLINE", 'COMMAND')
+
+        elif command == "CREATE_GROUP":
+            created = ChatServer.create_group(recipient, username)
+            msg = "GROUP CREATED" if created else "GROUP EXISTS"
+            send_framed_msg(client_socket, msg, 'COMMAND')
+            continue
+
+        elif command == "JOIN_GROUP":
+            joined = ChatServer.join_group(recipient, username)
+            msg = "JOINED GROUP" if joined else "GROUP NOT FOUND"
+            send_framed_msg(client_socket, msg, 'COMMAND')
+            continue
+
+        elif command == "LEAVE_GROUP":
+            left = ChatServer.leave_group(recipient, username)
+            msg = "LEFT GROUP" if left else "GROUP NOT FOUND OR NOT MEMBER"
+            send_framed_msg(client_socket, msg, 'COMMAND')
+            continue
+
+        elif command == "GET_PEER":
+            peer = ChatServer.get_peer_info(recipient)
+            if peer:
+                _, ip, port = peer
+                response = f"PEER_INFO:{recipient}:{ip}:{port}"
+            else:
+                response = "User OFFLINE"
+            send_framed_msg(client_socket, response, 'COMMAND')
+            continue
+        
+        else:
+            send_framed_msg(client_socket, "ERROR: UNKNOWN COMMAND.", 'COMMAND')
 
 def authenticate_client(client_socket: socket.socket, addr: socket._RetAddress) -> None:
     """
@@ -215,7 +230,7 @@ def authenticate_client(client_socket: socket.socket, addr: socket._RetAddress) 
     udp_port = int(port_msg.split(":")[1])
     
     with db_lock:
-        clients[username] = (client_socket, addr[0], udp_port)
+        ChatServer.register_client(username, client_socket, addr[0], udp_port)
     print(f"[REGISTERED] {username} at {addr[0]}:{udp_port}")
     
     # Immediately flush any offline messages waiting for them
