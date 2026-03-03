@@ -89,7 +89,7 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
                 send_framed_msg(client_socket, out_msg, 'DATA')
             del redis_message_queue[recipient]
 
-def handle_client(client_socket: socket.socket, addr: socket._RetAddress) -> None:
+def handle_client(client_socket: socket.socket, addr) -> None:
     """
     Handles the lifecycle of a client connection, including authentication and message processing.
     Parameters:
@@ -203,7 +203,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         else:
             send_framed_msg(client_socket, "ERROR: UNKNOWN COMMAND.", 'COMMAND')
 
-def authenticate_client(client_socket: socket.socket, addr: socket._RetAddress) -> None:
+def authenticate_client(client_socket: socket.socket, addr) -> None:
     """
     Handles the authentication process for a new client connection.
     Parameters:
