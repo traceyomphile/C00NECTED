@@ -1,3 +1,18 @@
+"""
+ARCP Server Implementation
+This module implements the ARCP server that handles client authentication, peer discovery, direct messaging, group chat management, and offline message queuing.
+The server listens for incoming TCP connections from clients, processes framed messages according to the defined protocol, and maintains global data structures for user management and message routing. It also ensures thread-safe access to shared resources using locks.
+Functions:
+- send_framed_msg: Frames a message with a header and sends it over a socket.
+- receive_framed_msg: Receives a framed message and returns the type and content.
+- flush_redis_queue: Checks for queued messages for a recipient and sends them upon login.
+- handle_client: Manages the lifecycle of a client connection, including authentication and message processing.
+- main_chat_loop: Processes incoming messages from the client after authentication.
+- authenticate_client: Handles the authentication process for a new client connection.
+- start_server: Initializes the TCP server and listens for incoming client connections.
+Date: 2024-06-01
+"""
+
 import socket
 import threading
 import ChatServer
