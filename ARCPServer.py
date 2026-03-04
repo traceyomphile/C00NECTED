@@ -17,6 +17,7 @@ Date: 2024-06-01
 import socket
 import threading
 import ChatServer
+import base64
 
 # Server Configuration
 HOST = socket.gethostbyname(socket.gethostname())
@@ -140,7 +141,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         msg_type, full_message = receive_framed_msg(client_socket)
         if not full_message: break
 
-        print(f"[RECEIVED] From {username}: {full_message}")
+        print(f"[RECEIVED] From {username}: {base64.b64encode(full_message.encode('utf-8'))}") # For encryption
         parts = full_message.split(":", 2)
 
         if len(parts) < 2:
