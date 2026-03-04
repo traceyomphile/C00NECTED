@@ -3,14 +3,13 @@ Client.py - A Python client for a chat application with P2P media transfer capab
 This client connects to a central server for authentication and message routing, while also managing a unique UDP
 port for direct peer-to-peer media exchanges. The client supports sending framed messages for both control and data, as well as receiving messages and media from peers.
 Functions:
-- receive_udp_media: Listens for incoming UDP datagrams and writes them to a file until
-  an EOF signal is received.
+- receive_udp_media: Listens for incoming UDP datagrams and writes them to a file until an EOF signal is received.
 - send_image_udp: Sends a file to a target IP and UDP port using datagram sockets.
 - send_framed_msg: Sends a framed message over a TCP socket with a specified message type.
-- receive_framed_msg: Receives a framed message from a TCP socket, extracting the
-  message type and content.
+- receive_framed_msg: Receives a framed message from a TCP socket, extracting the message type and content.
 - receive_tcp_messages: Listens for incoming TCP messages and processes them based on their type.
 - authenticate_console: Handles the interactive console registration/login logic.
+- print_commands: Displays the interactive help menu.
 - start_client: Initializes the client, manages authentication, and starts the main chat interface.
 Date: 2024-06-01
 """
@@ -20,9 +19,9 @@ import threading
 import os
 import time
 
-SERVER_IP ='196.47.192.177'
+SERVER_IP = socket.gethostbyname(socket.gethostname())
 TCP_PORT = 50000
-UDP_PORT = 0 # Different port for UDP media reception
+UDP_PORT = 0 # Ensures the OS picks a unique port for each client
 
 def receive_udp_media(udp_sock: socket.socket) -> None:
     """
@@ -30,7 +29,8 @@ def receive_udp_media(udp_sock: socket.socket) -> None:
     Parameters:
         - udp_sock: The UDP socket bound to the client's unique port for receiving media.
     Returns:
-        - None. The function runs indefinitely until an EOF signal is received, at which point it closes the socket."""
+        - None. The function runs indefinitely until an EOF signal is received, at which point it closes the socket.
+    """
     output_filename = f"received_{int(time.time())}.jpg" 
     try:
         bytes_received = 0
@@ -78,7 +78,7 @@ def send_image_udp(filepath, target_ip, target_udp_port) -> None:
         - target_udp_port: The UDP port on which the recipient client is listening for media.
     Returns:
         - None. The function reads the file in chunks and sends it as UDP datagrams until the entire file is transmitted, followed by an EOF signal.
-        """
+    """
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
     try:
@@ -108,7 +108,7 @@ def send_image_udp(filepath, target_ip, target_udp_port) -> None:
                 # A tiny sleep prevents overwhelming the local buffer during testing
                 time.sleep(0.001) 
                 
-        print(f"[UDP] Successfully transmitted {bytes_sent} bytes.")
+        print(f"[UDP] Successfully transmitted {bytes_sent} bytes to {target_ip}.")
         
     except FileNotFoundError:
         print(f"[ERROR] Could not find file: {filepath}")
@@ -167,12 +167,26 @@ def receive_tcp_messages(sock: socket.socket) -> None:
             msg_type, msg = receive_framed_msg(sock)
             if not msg: break
             
+            # --- P2P: Direct User File Transfer ---
             if msg_type == 'C' and msg.startswith("PEER_INFO:"):
                 _, target_user, t_ip, t_port = msg.split(':')
                 if target_user in pending_transfers:
                     filepath = pending_transfers.pop(target_user)
                     print(f"\n[SYSTEM] Peer found! Initiating P2P transfer of {filepath} to {target_user}...")
                     threading.Thread(target=send_image_udp, args=(filepath, t_ip, int(t_port)), daemon=True).start()
+                continue
+
+            # --- P2P: Group Broadcast File Transfer ---
+            if msg_type == 'C' and msg.startswith("GROUP_PEER_INFO:"):
+                parts = msg.split(':', 2)
+                group_name = parts[1]
+                peers_str = parts[2]
+                if group_name in pending_transfers:
+                    filepath = pending_transfers.pop(group_name)
+                    print(f"\n[SYSTEM] Group members found! Initiating Multicast P2P transfer to '{group_name}'...")
+                    for peer_str in peers_str.split('|'):
+                        ip, port = peer_str.split(',')
+                        threading.Thread(target=send_image_udp, args=(filepath, ip, int(port)), daemon=True).start()
                 continue
             
             print(f"\n{msg}")
@@ -187,7 +201,6 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
         - tcp_sock: The TCP socket through which authentication messages are sent and received.
     Returns:
         - The authenticated username as a string if login/registration is successful, or None if the user chooses to exit or authentication fails.
-        The function prompts the user for a username and checks with the server if it exists. If it does, it asks for a password and attempts to log in. If the username does not exist, it offers the option to register a new account. The process continues until successful authentication or user exit.
     """
     while True:
         username = input("Enter username: ").strip()
@@ -230,13 +243,21 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
             else:
                 return None # Exits program if they decline registration
 
+def print_commands():
+    """Helper function to print the interactive commands menu."""
+    print("\n--- Commands ---")
+    print("SEND:<user>:<message>            - Direct Message")
+    print("CREATE_GROUP:<group_name>        - Create a new group")
+    print("ADD_TO_GROUP:<group_name>:<user> - Add a user to a group")
+    print("LEAVE_GROUP:<group_name>         - Leave a group")
+    print("SEND_GROUP:<group_name>:<msg>    - Message a group")
+    print("SENDFILE:<user/group>:<filepath> - P2P Media Transfer")
+    print("COMMANDS                         - Show this help menu")
+    print("EXIT                             - Disconnect\n")
+
 def start_client() -> None:
     """
     Initializes the client, manages authentication, and starts the main chat interface.
-    Parameters:
-        - None. The function sets up the TCP connection, handles user authentication, binds a UDP socket for media reception, and starts threads for listening to both TCP and UDP messages. It also provides a command interface for sending messages and files to other users.
-    Returns:
-        - None. The function runs indefinitely until the user chooses to exit the chat interface.
     """
     # 1. Boot up TCP socket
     tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -262,50 +283,59 @@ def start_client() -> None:
     threading.Thread(target=receive_tcp_messages, args=(tcp_sock,), daemon=True).start()
 
     # 5. Main chat interface
+    print_commands()
+
     while True:
         msg = input(">> ").strip()
 
         if msg.upper() == "EXIT":
             break
 
-        parts = msg.split(":")
-        if len(parts) < 3:
-            print("[ERROR] Format: <COMMAND:<RECIPIENT_ID>:<DATA>")
+        if msg.upper() == "COMMANDS":
+            print_commands()
             continue
 
-        command, recipient = parts[0].upper(), parts[1]
+        # Split into a maximum of 3 parts to allow colons in the actual message
+        parts = msg.split(":", 2)
+        if len(parts) < 2:
+            print("[ERROR] Format: <COMMAND>:<RECIPIENT_ID>:<DATA>")
+            continue
+
+        command = parts[0].upper()
+        recipient = parts[1]
         data = parts[2] if len(parts) > 2 else ""
 
-        # File transfer command
         if command == "SENDFILE":
-            # Usage: SENDFILE <recipient_username> <file_path>
             filepath = data
             if not filepath:
-                print("[ERROR]: SENDFILE:<recipient_username>:<file_path>")
+                print("[ERROR] Format: SENDFILE:<recipient_username/group>:<file_path>")
                 continue
-
             pending_transfers[recipient] = filepath
             send_framed_msg(tcp_sock, f"GET_PEER:{recipient}", 'C')
-            continue
         
-        # Standard send command
         elif command == "SEND":
-            print(f"[DEBUG] Sending message to {recipient}: {data}")
             if not data:
-                print("[ERROR] Usage: SEND:<recipient_username>:<message>")
+                print("[ERROR] Format: SEND:<recipient_username>:<message>")
                 continue
-
             send_framed_msg(tcp_sock, f"SEND:{recipient}:{data}", 'D')
-            continue
+            
+        elif command == "SEND_GROUP":
+            if not data:
+                print("[ERROR] Format: SEND_GROUP:<group_name>:<message>")
+                continue
+            send_framed_msg(tcp_sock, f"SEND_GROUP:{recipient}:{data}", 'D')
 
-        # Group management commands
-        elif command in ["CREATE_GROUP", "JOIN_GROUP", "LEAVE_GROUP"]:
+        elif command in ["CREATE_GROUP", "LEAVE_GROUP"]:
             send_framed_msg(tcp_sock, f"{command}:{recipient}", 'C')
-        
-        # Peer lookup command
+            
+        elif command == "ADD_TO_GROUP":
+            if not data:
+                print("[ERROR] Format: ADD_TO_GROUP:<group_name>:<user_to_add>")
+                continue
+            send_framed_msg(tcp_sock, f"ADD_TO_GROUP:{recipient}:{data}", 'C')
+
         elif command == "GET_PEER":
             send_framed_msg(tcp_sock, f"GET_PEER:{recipient}", 'C')
-            continue
 
         else:
             print("[ERROR] Unknown command.\n")

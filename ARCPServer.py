@@ -5,6 +5,7 @@ The server listens for incoming TCP connections from clients, processes framed m
 Functions:
 - send_framed_msg: Frames a message with a header and sends it over a socket.
 - receive_framed_msg: Receives a framed message and returns the type and content.
+- queue_offline_message: Helper function to append a message to a user's offline queue.
 - flush_redis_queue: Checks for queued messages for a recipient and sends them upon login.
 - handle_client: Manages the lifecycle of a client connection, including authentication and message processing.
 - main_chat_loop: Processes incoming messages from the client after authentication.
@@ -27,14 +28,12 @@ db_lock: threading.Lock = threading.Lock()
 postgresql_users: dict[str, str] = {
     "kb": "password123",
     "amahle": "securepass",
-    "jacques": "cricketGOAT"
+    "jacques": "cricketGOAT",
+    "tracy": "testpass"
 }
 
-# Tuple-keyed Dictionary for Offline Queue: recipient -> [(sender, message), ...]
-redis_message_queue: dict[str, list[tuple[str, str]]] = {} 
-
-# Online Tracker: username -> (tcp_socket, ip, udp_port)
-clients: dict[str, tuple[socket.socket, str, int]] = {} 
+# Updated Dictionary: recipient -> [formatted_message_string, ...]
+redis_message_queue: dict[str, list[str]] = {} 
 
 def send_framed_msg(sock: socket.socket, message: str, msg_type: str = 'D') -> None:
     """
@@ -51,7 +50,7 @@ def send_framed_msg(sock: socket.socket, message: str, msg_type: str = 'D') -> N
     header = f"{msg_type}{len(data):04d}".encode('ascii')
     sock.sendall(header + data)
 
-def receive_framed_msg(sock: socket.socket) -> tuple[str, str]:
+def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, None]:
     """
     Receives a framed message and returns the type and content.
     Expects the same header format as send_framed_msg.
@@ -73,9 +72,18 @@ def receive_framed_msg(sock: socket.socket) -> tuple[str, str]:
         data += packet
     return msg_type, data.decode('ascii')
 
+def queue_offline_message(recipient: str, formatted_msg: str) -> None:
+    """
+    Helper function to append a message to a user's offline queue.
+    """
+    with db_lock:
+        if recipient not in redis_message_queue:
+            redis_message_queue[recipient] = []
+        redis_message_queue[recipient].append(formatted_msg)
+
 def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
     """
-    Checks if there are any queued messages for the recipient in the Redis queue and sends them.
+    Checks if there are any queued messages for the recipient in the Redis queue and sends them sequentially.
     Parameters:
         - client_socket: The socket to send the queued messages through.
         - recipient: The username of the recipient to check for queued messages.
@@ -86,8 +94,8 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
         if recipient not in redis_message_queue:
             return
         
-        for sender, msg in redis_message_queue[recipient]:
-            send_framed_msg(client_socket, f"FROM:{sender}:{msg}", 'D')
+        for msg in redis_message_queue[recipient]:
+            send_framed_msg(client_socket, f"[OFFLINE QUEUE] {msg}", 'D')
         del redis_message_queue[recipient]
 
 def handle_client(client_socket: socket.socket, addr) -> None:
@@ -115,7 +123,7 @@ def handle_client(client_socket: socket.socket, addr) -> None:
     finally:
         client_socket.close()
         with db_lock:
-            if username and username in ChatServer.clients:    # Ensure username is not None.
+            if username and ChatServer.get_peer_info(username): 
                 ChatServer.remove_client(username)
                 print(f"[DISCONNECTED] {username}")
 
@@ -132,22 +140,10 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         msg_type, full_message = receive_framed_msg(client_socket)
         if not full_message: break
 
-        # PEER DISCOVERY LOGIC
-        if msg_type == 'C' and full_message.startswith("GET_PEER:"):
-            target_user = full_message.split(":")[1]
-            if target_user in clients:
-                _, t_ip, t_port = clients[target_user]
-                response = f"PEER_INFO:{target_user}:{t_ip}:{t_port}"
-                send_framed_msg(client_socket, response, 'C')
-            else:
-                send_framed_msg(client_socket, f"ERROR: User {target_user} not online.", 'C')
-            continue
-
-        # DIRECT MESSAGING LOGIC (/sendmsg)
         print(f"[RECEIVED] From {username}: {full_message}")
         parts = full_message.split(":", 2)
 
-        if len(parts) < 3:
+        if len(parts) < 2:
             send_framed_msg(client_socket, "ERROR: Invalid message format.", 'C')
             continue
 
@@ -156,52 +152,71 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         data = parts[2] if len(parts) > 2 else ""
 
         if command == "SEND":
-            # Case 1: Recipient is an online user
-            sent = ChatServer.send_dm(username, recipient, data, send_framed_msg)
+            # Check if target is online before sending to provide Last Seen feedback
+            target_online = ChatServer.get_peer_info(recipient) is not None
+            
+            # Handles Direct Messages & Offline Queuing
+            ChatServer.send_dm(username, recipient, data, send_framed_msg, queue_offline_message)
+            
+            # Feature: Last Seen notification if queued offline!
+            if not target_online:
+                last_seen_time = ChatServer.get_last_seen(recipient)
+                send_framed_msg(client_socket, f"QUEUED_OFFLINE: User last seen at {last_seen_time}", 'C')
 
-            if sent:
-                continue
-
-            # Case 2: Recipient is a group
-            sent_to_group = ChatServer.send_group_message(username, recipient, data, send_framed_msg)
-            if sent_to_group:
-                continue
-
-            # Case 3: Recipient is offline user -> Queue in Redis
-            with db_lock:
-                if recipient not in redis_message_queue:
-                    redis_message_queue[recipient] = []
-                redis_message_queue[recipient].append((username, data))
-
-            send_framed_msg(client_socket, "QUEUED_OFFLINE", 'C')
+        elif command == "SEND_GROUP":
+            # Handles Group Messages
+            status = ChatServer.send_group_message(username, recipient, data, send_framed_msg, queue_offline_message)
+            if status != "SUCCESS":
+                send_framed_msg(client_socket, f"ERROR: {status}", 'C')
 
         elif command == "CREATE_GROUP":
             created = ChatServer.create_group(recipient, username)
             msg = "GROUP CREATED" if created else "GROUP EXISTS"
             send_framed_msg(client_socket, msg, 'C')
-            continue
 
-        elif command == "JOIN_GROUP":
-            joined = ChatServer.join_group(recipient, username)
-            msg = "JOINED GROUP" if joined else "GROUP NOT FOUND"
-            send_framed_msg(client_socket, msg, 'C')
-            continue
+        elif command == "ADD_TO_GROUP":
+            # 'data' holds the target username to add
+            status = ChatServer.add_to_group(recipient, username, data)
+            
+            # Feature: System Notification for Added User
+            if status == "SUCCESS":
+                sys_msg = f"You were added to group '{recipient}' by {username}."
+                # We send this as a DM from "SYSTEM" so it queues if they are offline
+                ChatServer.send_dm("SYSTEM", data, sys_msg, send_framed_msg, queue_offline_message)
+                
+            send_framed_msg(client_socket, f"ADD_STATUS: {status}", 'C')
 
         elif command == "LEAVE_GROUP":
             left = ChatServer.leave_group(recipient, username)
-            msg = "LEFT GROUP" if left else "GROUP NOT FOUND OR NOT MEMBER"
-            send_framed_msg(client_socket, msg, 'C')
-            continue
+            if left:
+                # Feature: System Notification for Remaining Members
+                sys_msg = f"{username} has left the group."
+                ChatServer.send_group_message("SYSTEM", recipient, sys_msg, send_framed_msg, queue_offline_message)
+                send_framed_msg(client_socket, "LEFT GROUP", 'C')
+            else:
+                send_framed_msg(client_socket, "GROUP NOT FOUND OR NOT MEMBER", 'C')
 
         elif command == "GET_PEER":
             peer = ChatServer.get_peer_info(recipient)
             if peer:
+                # Target is an individual online user
                 _, ip, port = peer
                 response = f"PEER_INFO:{recipient}:{ip}:{port}"
+                send_framed_msg(client_socket, response, 'C')
             else:
-                response = "User OFFLINE"
-            send_framed_msg(client_socket, response, 'C')
-            continue
+                # Feature: Group File Sharing Support
+                if ChatServer.is_group(recipient):
+                    peers = ChatServer.get_group_peers(recipient, exclude_user=username)
+                    if peers:
+                        # Format: "ip1,port1|ip2,port2|ip3,port3"
+                        peers_str = "|".join([f"{ip},{port}" for ip, port in peers])
+                        response = f"GROUP_PEER_INFO:{recipient}:{peers_str}"
+                        send_framed_msg(client_socket, response, 'C')
+                    else:
+                        send_framed_msg(client_socket, f"ERROR: No other members online in group {recipient}.", 'C')
+                else:
+                    last_seen_time = ChatServer.get_last_seen(recipient)
+                    send_framed_msg(client_socket, f"ERROR: User OFFLINE. Last seen at {last_seen_time}", 'C')
         
         else:
             send_framed_msg(client_socket, "ERROR: UNKNOWN COMMAND.", 'C')
@@ -213,7 +228,7 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
         - client_socket: The socket representing the client's connection.
         - addr: The address of the client.
     Returns:
-        - None
+        - The authenticated username, or None if authentication fails.
     """
     while True:
         _, msg = receive_framed_msg(client_socket)
@@ -233,7 +248,7 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
                 continue
 
             with db_lock:
-                if login_user in ChatServer.clients:
+                if ChatServer.get_peer_info(login_user):
                     send_framed_msg(client_socket, "ALREADY ONLINE", 'A')
                     continue
 
@@ -260,8 +275,8 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
     _, port_msg = receive_framed_msg(client_socket)
     udp_port = int(port_msg.split(":")[1])
     
-    with db_lock:
-        ChatServer.register_client(username, client_socket, addr[0], udp_port)
+    # Register with the Global ChatServer logic
+    ChatServer.register_client(username, client_socket, addr[0], udp_port)
     print(f"[REGISTERED] {username} at {addr[0]}:{udp_port}")
     
     # Immediately flush any offline messages waiting for them
