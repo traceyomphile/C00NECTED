@@ -268,9 +268,9 @@ def start_client() -> None:
         if msg.upper() == "EXIT":
             break
 
-        parts = msg.split(" ", 2)
-        if len(parts) < 2:
-            print("[ERROR] Format: <COMMAND> <RECIPIENT_ID> <DATA>")
+        parts = msg.split(":")
+        if len(parts) < 3:
+            print("[ERROR] Format: <COMMAND:<RECIPIENT_ID>:<DATA>")
             continue
 
         command, recipient = parts[0].upper(), parts[1]
@@ -290,11 +290,12 @@ def start_client() -> None:
         
         # Standard send command
         elif command == "SEND":
+            print(f"[DEBUG] Sending message to {recipient}: {data}")
             if not data:
                 print("[ERROR] Usage: SEND:<recipient_username>:<message>")
                 continue
 
-            send_framed_msg(tcp_sock, f"SEND:{recipient}{data}", 'D')
+            send_framed_msg(tcp_sock, f"SEND:{recipient}:{data}", 'D')
             continue
 
         # Group management commands
@@ -307,7 +308,7 @@ def start_client() -> None:
             continue
 
         else:
-            print("[ERROR] Unknown command.")
+            print("[ERROR] Unknown command.\n")
 
 if __name__ == "__main__":
     start_client()

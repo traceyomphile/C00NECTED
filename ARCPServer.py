@@ -83,11 +83,12 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
         - None
     """
     with db_lock:
-        if recipient in redis_message_queue:
-            for sender, msg in redis_message_queue[recipient]:
-                out_msg = f"[OFFLINE QUEUE] [{sender}]: {msg}"
-                send_framed_msg(client_socket, out_msg, 'D')
-            del redis_message_queue[recipient]
+        if recipient not in redis_message_queue:
+            return
+        
+        for sender, msg in redis_message_queue[recipient]:
+            send_framed_msg(client_socket, f"FROM:{sender}:{msg}", 'D')
+        del redis_message_queue[recipient]
 
 def handle_client(client_socket: socket.socket, addr) -> None:
     """
@@ -114,8 +115,8 @@ def handle_client(client_socket: socket.socket, addr) -> None:
     finally:
         client_socket.close()
         with db_lock:
-            if username and username in clients:    # Ensure username is not None.
-                del clients[username]
+            if username and username in ChatServer.clients:    # Ensure username is not None.
+                ChatServer.remove_client(username)
                 print(f"[DISCONNECTED] {username}")
 
 def main_chat_loop(client_socket: socket.socket, username: str) -> None:
@@ -143,9 +144,10 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             continue
 
         # DIRECT MESSAGING LOGIC (/sendmsg)
-        parts = full_message.split(" ", 2)
+        print(f"[RECEIVED] From {username}: {full_message}")
+        parts = full_message.split(":", 2)
 
-        if len(parts) < 2:
+        if len(parts) < 3:
             send_framed_msg(client_socket, "ERROR: Invalid message format.", 'C')
             continue
 
@@ -226,17 +228,30 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
                 
         elif msg.startswith("LOGIN:"):
             _, login_user, login_pwd = msg.split(":", 2)
-            if postgresql_users.get(login_user) == login_pwd:
-                username = login_user
-                send_framed_msg(client_socket, "SUCCESS", 'A')
-                break # Exit auth loop!
-            else:
+            if postgresql_users.get(login_user) != login_pwd:
                 send_framed_msg(client_socket, "FAIL", 'A')
+                continue
+
+            with db_lock:
+                if login_user in ChatServer.clients:
+                    send_framed_msg(client_socket, "ALREADY ONLINE", 'A')
+                    continue
+
+            username = login_user
+            send_framed_msg(client_socket, "SUCCESS", 'A')
+            break # Exit auth loop!
+                
                 
         elif msg.startswith("REG:"):
             _, reg_user, reg_pwd = msg.split(":", 2)
+
             with db_lock:
+                if reg_user in postgresql_users:
+                    send_framed_msg(client_socket, "USER_EXISTS", 'A')
+                    continue
+
                 postgresql_users[reg_user] = reg_pwd
+
             username = reg_user
             send_framed_msg(client_socket, "SUCCESS", 'A')
             break # Exit auth loop!
