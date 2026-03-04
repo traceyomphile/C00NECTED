@@ -143,9 +143,10 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             continue
 
         # DIRECT MESSAGING LOGIC (/sendmsg)
-        parts = full_message.split(" ", 2)
+        print(f"[RECEIVED] From {username}: {full_message}")
+        parts = full_message.split(":", 2)
 
-        if len(parts) < 2:
+        if len(parts) < 3:
             send_framed_msg(client_socket, "ERROR: Invalid message format.", 'C')
             continue
 
