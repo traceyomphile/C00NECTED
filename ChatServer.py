@@ -3,16 +3,16 @@ Chat Server Implementation
 This module implements the core server-side logic for managing client connections, group memberships, and message routing in a chat application. It maintains a global registry of connected clients and groups, allowing for direct messaging, group messaging, and peer information retrieval. The server ensures thread-safe access to shared data structures using locks.
 Functions:
 - register_client: Registers a new client in the global clients dictionary.
-- remove_client: Removes a client from the global clients dictionary upon disconnection and records last seen time.
+- remove_client: Removes a client from the global clients dictionary upon disconnection.
 - get_peer_info: Retrieves the connection information for a given username.
-- get_last_seen: Fetches the last seen timestamp of an offline user.
-- is_group: Checks if a target string corresponds to a registered group.
-- get_group_peers: Gets the IP and UDP port of all online members of a group for P2P transfers.
-- send_dm: Sends a direct message from sender to target, or queues it if the target is offline.
+- get_last_seen: Fetches the exact timestamp a user disconnected.
+- is_group: Checks if a target ID is a registered group.
+- get_group_peers: Retrieves the IPs and ports of all online group members for P2P multicasting.
+- send_dm: Sends a direct message from sender to target if the target is online, or queues it if offline.
 - create_group: Creates a new group with the specified group_id and adds the creator as the first member.
-- add_to_group: Allows an existing group member to add a new user to the group.
+- add_to_group: Adds a user to an existing group, ensuring the adder is already a member.
 - leave_group: Removes a user from a group and cleans up empty groups.
-- send_group_message: Sends a message to all group members, queuing it for those currently offline.
+- send_group_message: Sends a message to all members of a group except the sender, queuing for offline members.
 Date: 2024-06-01
 """
 
@@ -22,7 +22,7 @@ from datetime import datetime
 
 clients = {}
 last_seen = {} # Tracks when users disconnect: username -> timestamp
-groups = {}    # group_id -> set of usernames
+groups = {} # group_id -> set of usernames
 clients_lock: Lock = Lock()
 
 def get_timestamp() -> str:
@@ -45,7 +45,7 @@ def register_client(username: str, client_socket: socket.socket, ip: str, udp_po
 
 def remove_client(username: str) -> None:
     """
-    Removes a client from the global clients dictionary upon disconnection and records their exact disconnect time.
+    Removes a client from the global clients dictionary upon disconnection.
     Parameters:
         - username: The unique identifier for the client to be removed.
     Returns:
@@ -63,7 +63,7 @@ def get_last_seen(username: str) -> str:
     Parameters:
         - username: The unique identifier for the client.
     Returns:
-        - A string containing the timestamp or a status message.
+        - A string containing the timestamp or a default status message.
     """
     with clients_lock:
         return last_seen.get(username, "Never logged in or currently online")
@@ -110,7 +110,7 @@ def get_group_peers(group_id: str, exclude_user: str) -> list:
 
 def send_dm(sender: str, target: str, content: str, send_func: callable, queue_func: callable) -> bool:
     """
-    Sends a direct message from sender to target, or queues it if the target is offline.
+    Sends a direct message from sender to target if the target is online.
     Parameters:
         - sender: The username of the message sender.
         - target: The username of the message recipient.
@@ -121,14 +121,16 @@ def send_dm(sender: str, target: str, content: str, send_func: callable, queue_f
         - True if the message was processed successfully (sent or queued).
     """
     timestamped_msg = f"[{get_timestamp()}] [{sender} (DM)]: {content}"
-    
     with clients_lock:
         if target in clients:
-            sock = clients[target][0]
-            send_func(sock, timestamped_msg, 'D')
+            try:
+                sock = clients[target][0]
+                send_func(sock, timestamped_msg, 'D')
+            except Exception:
+                # If the socket is dead but hasn't been cleaned up yet, queue it.
+                queue_func(target, timestamped_msg)
         else:
             queue_func(target, timestamped_msg)
-            
     return True
 
 def create_group(group_id: str, creator: str) -> bool:
@@ -148,7 +150,7 @@ def create_group(group_id: str, creator: str) -> bool:
     
 def add_to_group(group_id: str, adder_username: str, target_username: str) -> str:
     """
-    Allows an existing group member to add a new user to the group.
+    Adds a user to an existing group.
     Parameters:
         - group_id: The unique identifier for the group.
         - adder_username: The username of the client attempting to add someone.
@@ -169,7 +171,7 @@ def add_to_group(group_id: str, adder_username: str, target_username: str) -> st
     
 def leave_group(group_id: str, username: str) -> bool:
     """
-    Removes a user from a group and cleans up the group if it becomes empty.
+    Removes a user from a group.
     Parameters:
         - group_id: The unique identifier for the group to leave.
         - username: The username of the client attempting to leave the group.
@@ -187,10 +189,10 @@ def leave_group(group_id: str, username: str) -> bool:
     
 def send_group_message(sender: str, group_id: str, message: str, send_func: callable, queue_func: callable) -> str:
     """
-    Sends a message to all members of a group except the sender, queuing it for offline members.
+    Sends a message to all members of a group except the sender.
     Parameters:
         - sender: The username of the message sender.
-        - group_id: The unique identifier for the group.
+        - group_id: The unique identifier for the group to which the message should be sent.
         - message: The message content to be sent.
         - send_func: A function to send framed messages to a socket.
         - queue_func: A function to queue the message for offline members.
@@ -209,8 +211,12 @@ def send_group_message(sender: str, group_id: str, message: str, send_func: call
         for member in groups[group_id]:
             if member != sender:
                 if member in clients:
-                    sock = clients[member][0]
-                    send_func(sock, timestamped_msg, 'D')
+                    try:
+                        sock = clients[member][0]
+                        send_func(sock, timestamped_msg, 'D')
+                    except Exception:
+                        # Ensures one broken client doesn't break the loop for others
+                        queue_func(member, timestamped_msg)
                 else:
                     queue_func(member, timestamped_msg)
                     

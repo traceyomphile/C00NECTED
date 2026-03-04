@@ -245,15 +245,18 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
 
 def print_commands():
     """Helper function to print the interactive commands menu."""
-    print("\n--- Commands ---")
-    print("SEND:<user>:<message>            - Direct Message")
-    print("CREATE_GROUP:<group_name>        - Create a new group")
-    print("ADD_TO_GROUP:<group_name>:<user> - Add a user to a group")
-    print("LEAVE_GROUP:<group_name>         - Leave a group")
-    print("SEND_GROUP:<group_name>:<msg>    - Message a group")
-    print("SENDFILE:<user/group>:<filepath> - P2P Media Transfer")
-    print("COMMANDS                         - Show this help menu")
-    print("EXIT                             - Disconnect\n")
+    menu = (
+        "\n--- Commands ---\n"
+        "SEND:<user>:<message>            - Direct Message\n"
+        "CREATE_GROUP:<group_name>        - Create a new group\n"
+        "ADD_TO_GROUP:<group_name>:<user> - Add a user to a group\n"
+        "LEAVE_GROUP:<group_name>         - Leave a group\n"
+        "SEND_GROUP:<group_name>:<msg>    - Message a group\n"
+        "SENDFILE:<user/group>:<filepath> - P2P Media Transfer\n"
+        "COMMANDS                         - Show this help menu\n"
+        "EXIT                             - Disconnect\n"
+    )
+    print(menu)
 
 def start_client() -> None:
     """
@@ -278,13 +281,14 @@ def start_client() -> None:
     send_framed_msg(tcp_sock, f"PORT:{my_udp_port}", 'A')
     print(f"[UDP] Listening for P2P media on unique port {my_udp_port}...")
 
+    # Print the menu BEFORE starting the background listener to avoid messy interleaving
+    print_commands()
+
     # 4. Start concurrent listener threads
     threading.Thread(target=receive_udp_media, args=(udp_sock,), daemon=True).start()
     threading.Thread(target=receive_tcp_messages, args=(tcp_sock,), daemon=True).start()
 
     # 5. Main chat interface
-    print_commands()
-
     while True:
         msg = input(">> ").strip()
 

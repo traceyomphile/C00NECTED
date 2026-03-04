@@ -17,7 +17,6 @@ Date: 2024-06-01
 import socket
 import threading
 import ChatServer
-import base64
 
 # Server Configuration
 HOST = socket.gethostbyname(socket.gethostname())
@@ -96,7 +95,7 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
             return
         
         for msg in redis_message_queue[recipient]:
-            send_framed_msg(client_socket, f"{msg}", 'D')
+            send_framed_msg(client_socket, msg, 'D')
         del redis_message_queue[recipient]
 
 def handle_client(client_socket: socket.socket, addr) -> None:
@@ -141,7 +140,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         msg_type, full_message = receive_framed_msg(client_socket)
         if not full_message: break
 
-        print(f"[RECEIVED] From {username}: {base64.b64encode(full_message.encode('utf-8'))}")
+        print(f"[RECEIVED] From {username}: {full_message}")
         parts = full_message.split(":", 2)
 
         if len(parts) < 2:
@@ -159,10 +158,11 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             # Handles Direct Messages & Offline Queuing
             ChatServer.send_dm(username, recipient, data, send_framed_msg, queue_offline_message)
             
-            # Feature: Last Seen notification if queued offline!
+            # Feature: Friendly Last Seen notification
             if not target_online:
                 last_seen_time = ChatServer.get_last_seen(recipient)
-                send_framed_msg(client_socket, f"User last seen at {last_seen_time}", 'C')
+                sys_msg = f"[SYSTEM] Message sent. User '{recipient}' is currently offline. Last seen at {last_seen_time}."
+                send_framed_msg(client_socket, sys_msg, 'C')
 
         elif command == "SEND_GROUP":
             # Handles Group Messages
