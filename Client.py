@@ -117,13 +117,13 @@ def send_image_udp(filepath, target_ip, target_udp_port) -> None:
     finally:
         udp_sock.close()
 
-def send_framed_msg(sock: socket.socket, message: str, msg_type: str='DATA') -> None:
+def send_framed_msg(sock: socket.socket, message: str, msg_type: str='D') -> None:
     """
     Sends a framed message over a TCP socket with a specified message type.
     Parameters:
         - sock: The TCP socket through which the message will be sent.
         - message: The string message to be sent.
-        - msg_type: A string indicating the type of message (default is 'DATA').
+        - msg_type: A single-character indicating the type of message (default is 'D').
     Returns:
         - None. The function encodes the message with a header containing the message type and length, and sends it through the socket.
     """
@@ -191,7 +191,7 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
     """
     while True:
         username = input("Enter username: ").strip()
-        send_framed_msg(tcp_sock, f"CHECK {username}", 'A')
+        send_framed_msg(tcp_sock, f"CHECK:{username}", 'A')
         _, resp = receive_framed_msg(tcp_sock)
         
         if resp == "EXISTS":
@@ -200,7 +200,7 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
                 if pwd.lower() == 'exit':
                     return None
                 
-                send_framed_msg(tcp_sock, f"LOGIN {username}:{pwd}", 'A')
+                send_framed_msg(tcp_sock, f"LOGIN:{username}:{pwd}", 'A')
                 _, auth_resp = receive_framed_msg(tcp_sock)
                 
                 if auth_resp == "SUCCESS":
@@ -214,14 +214,14 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
             if reg == 'yes':
                 while True:
                     new_user = input("Enter a unique username: ").strip()
-                    send_framed_msg(tcp_sock, f"CHECK {new_user}", 'A')
+                    send_framed_msg(tcp_sock, f"CHECK:{new_user}", 'A')
                     _, check_resp = receive_framed_msg(tcp_sock)
                     
                     if check_resp == "EXISTS":
                         print("[ERROR] Username already taken. Try another.")
                     else:
                         new_pwd = input("Enter new password: ").strip()
-                        send_framed_msg(tcp_sock, f"REG {new_user}:{new_pwd}", 'A')
+                        send_framed_msg(tcp_sock, f"REG:{new_user}:{new_pwd}", 'A')
                         _, reg_resp = receive_framed_msg(tcp_sock)
                         
                         if reg_resp == "SUCCESS":
@@ -254,7 +254,7 @@ def start_client() -> None:
     udp_sock.bind(('0.0.0.0', 0))
     my_udp_port = udp_sock.getsockname()[1]
     
-    send_framed_msg(tcp_sock, f"PORT {my_udp_port}", 'A')
+    send_framed_msg(tcp_sock, f"PORT:{my_udp_port}", 'A')
     print(f"[UDP] Listening for P2P media on unique port {my_udp_port}...")
 
     # 4. Start concurrent listener threads
@@ -281,29 +281,29 @@ def start_client() -> None:
             # Usage: SENDFILE <recipient_username> <file_path>
             filepath = data
             if not filepath:
-                print("[ERROR]: SENDFILE <>recipient_username> <file_path>")
+                print("[ERROR]: SENDFILE:<recipient_username>:<file_path>")
                 continue
 
             pending_transfers[recipient] = filepath
-            send_framed_msg(tcp_sock, f"GET_PEER {recipient}", 'COMMAND')
+            send_framed_msg(tcp_sock, f"GET_PEER:{recipient}", 'C')
             continue
         
         # Standard send command
         elif command == "SEND":
             if not data:
-                print("[ERROR] Usage: SEND <recipient_username> <message>")
+                print("[ERROR] Usage: SEND:<recipient_username>:<message>")
                 continue
 
-            send_framed_msg(tcp_sock, f"{recipient} {data}", 'DATA')
+            send_framed_msg(tcp_sock, f"SEND:{recipient}{data}", 'D')
             continue
 
         # Group management commands
         elif command in ["CREATE_GROUP", "JOIN_GROUP", "LEAVE_GROUP"]:
-            send_framed_msg(tcp_sock, f"{command} {recipient}", 'COMMAND')
+            send_framed_msg(tcp_sock, f"{command}:{recipient}", 'C')
         
         # Peer lookup command
         elif command == "GET_PEER":
-            send_framed_msg(tcp_sock, f"GET_PEER {recipient}", 'COMMAND')
+            send_framed_msg(tcp_sock, f"GET_PEER:{recipient}", 'C')
             continue
 
         else:

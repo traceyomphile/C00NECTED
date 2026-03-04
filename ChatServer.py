@@ -71,7 +71,7 @@ def send_dm(sender: str, target: str, content: str, send_func: callable) -> bool
     with clients_lock:
         if target in clients:
             sock = clients[target][0]
-            send_func(sock, f"[{sender}]: {content}", 'DATA')
+            send_func(sock, f"[{sender}]: {content}", 'D')
             return True
     return False
 
@@ -134,9 +134,12 @@ def send_group_message(sender: str, group_id: str, message: str, send_func: call
     with clients_lock:
         if group_id not in groups:
             return False
-        members = groups[group_id]
-        for member in members:
+        
+        delivered = False
+        for member in groups[group_id]:
             if member != sender and member in clients:
                 sock = clients[member][0]
-                send_func(sock, f"[{group_id}] {group_id}: {message}", 'D')
-        return True
+                send_func(sock, f"[{group_id}] {sender}: {message}", 'D')
+                delivered = True
+                
+        return delivered

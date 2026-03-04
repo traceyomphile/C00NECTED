@@ -36,14 +36,14 @@ redis_message_queue: dict[str, list[tuple[str, str]]] = {}
 # Online Tracker: username -> (tcp_socket, ip, udp_port)
 clients: dict[str, tuple[socket.socket, str, int]] = {} 
 
-def send_framed_msg(sock: socket.socket, message: str, msg_type: str = 'DATA') -> None:
+def send_framed_msg(sock: socket.socket, message: str, msg_type: str = 'D') -> None:
     """
     Frames a message with a header and sends it over the socket.
     Header Format: [Type (1 char)][Length (4 chars)]
     Parameters:
         - sock: The socket to send the message through.
         - message: The content of the message to send.
-        - msg_type: A string indicating the type of message (e.g., 'DATA', 'COMMAND', 'ACTION').
+        - msg_type: A single-character indicating the type of message (e.g., 'D', 'C', 'A').
     Returns:
         - None
     """
@@ -58,7 +58,7 @@ def receive_framed_msg(sock: socket.socket) -> tuple[str, str]:
     Parameters:
         - sock: The socket to read from.
     Returns:
-        - msg_type: The type of the message (e.g., 'DATA', 'COMMAND', 'ACTION').
+        - msg_type: The type of the message (e.g., 'D', 'C', 'A').
         - message: The content of the message as a string.
     """
     header = sock.recv(5)
@@ -86,7 +86,7 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
         if recipient in redis_message_queue:
             for sender, msg in redis_message_queue[recipient]:
                 out_msg = f"[OFFLINE QUEUE] [{sender}]: {msg}"
-                send_framed_msg(client_socket, out_msg, 'DATA')
+                send_framed_msg(client_socket, out_msg, 'D')
             del redis_message_queue[recipient]
 
 def handle_client(client_socket: socket.socket, addr) -> None:
@@ -101,8 +101,11 @@ def handle_client(client_socket: socket.socket, addr) -> None:
     username = None
     try:
         # Authenticate user and register in clients dict
-        authenticate_client(client_socket, addr)
+        username = authenticate_client(client_socket, addr)
 
+        if not username:
+            return # Authentication failed or client disconnected
+        
         # Implement chat logic
         main_chat_loop(client_socket, username)
                             
@@ -111,7 +114,7 @@ def handle_client(client_socket: socket.socket, addr) -> None:
     finally:
         client_socket.close()
         with db_lock:
-            if username in clients:
+            if username and username in clients:    # Ensure username is not None.
                 del clients[username]
                 print(f"[DISCONNECTED] {username}")
 
@@ -129,12 +132,12 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         if not full_message: break
 
         # PEER DISCOVERY LOGIC
-        if msg_type == 'COMMAND' and full_message.startswith("GET_PEER:"):
+        if msg_type == 'C' and full_message.startswith("GET_PEER:"):
             target_user = full_message.split(":")[1]
             if target_user in clients:
                 _, t_ip, t_port = clients[target_user]
                 response = f"PEER_INFO:{target_user}:{t_ip}:{t_port}"
-                send_framed_msg(client_socket, response, 'COMMAND')
+                send_framed_msg(client_socket, response, 'C')
             else:
                 send_framed_msg(client_socket, f"ERROR: User {target_user} not online.", 'C')
             continue
@@ -143,7 +146,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         parts = full_message.split(" ", 2)
 
         if len(parts) < 2:
-            send_framed_msg(client_socket, "ERROR: Invalid message format.", 'COMMAND')
+            send_framed_msg(client_socket, "ERROR: Invalid message format.", 'C')
             continue
 
         command = parts[0]
@@ -152,11 +155,9 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
 
         if command == "SEND":
             # Case 1: Recipient is an online user
-            peer = ChatServer.get_peer_info(recipient)
+            sent = ChatServer.send_dm(username, recipient, data, send_framed_msg)
 
-            if peer:
-                sock = peer[0]
-                send_framed_msg(sock, f"{username}: {data}", 'DATA')
+            if sent:
                 continue
 
             # Case 2: Recipient is a group
@@ -170,24 +171,24 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                     redis_message_queue[recipient] = []
                 redis_message_queue[recipient].append((username, data))
 
-            send_framed_msg(client_socket, "QUEUED_OFFLINE", 'COMMAND')
+            send_framed_msg(client_socket, "QUEUED_OFFLINE", 'C')
 
         elif command == "CREATE_GROUP":
             created = ChatServer.create_group(recipient, username)
             msg = "GROUP CREATED" if created else "GROUP EXISTS"
-            send_framed_msg(client_socket, msg, 'COMMAND')
+            send_framed_msg(client_socket, msg, 'C')
             continue
 
         elif command == "JOIN_GROUP":
             joined = ChatServer.join_group(recipient, username)
             msg = "JOINED GROUP" if joined else "GROUP NOT FOUND"
-            send_framed_msg(client_socket, msg, 'COMMAND')
+            send_framed_msg(client_socket, msg, 'C')
             continue
 
         elif command == "LEAVE_GROUP":
             left = ChatServer.leave_group(recipient, username)
             msg = "LEFT GROUP" if left else "GROUP NOT FOUND OR NOT MEMBER"
-            send_framed_msg(client_socket, msg, 'COMMAND')
+            send_framed_msg(client_socket, msg, 'C')
             continue
 
         elif command == "GET_PEER":
@@ -197,13 +198,13 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 response = f"PEER_INFO:{recipient}:{ip}:{port}"
             else:
                 response = "User OFFLINE"
-            send_framed_msg(client_socket, response, 'COMMAND')
+            send_framed_msg(client_socket, response, 'C')
             continue
         
         else:
-            send_framed_msg(client_socket, "ERROR: UNKNOWN COMMAND.", 'COMMAND')
+            send_framed_msg(client_socket, "ERROR: UNKNOWN COMMAND.", 'C')
 
-def authenticate_client(client_socket: socket.socket, addr) -> None:
+def authenticate_client(client_socket: socket.socket, addr) -> str | None:
     """
     Handles the authentication process for a new client connection.
     Parameters:
@@ -213,31 +214,31 @@ def authenticate_client(client_socket: socket.socket, addr) -> None:
         - None
     """
     while True:
-        msg_type, msg = receive_framed_msg(client_socket)
-        if not msg: return # Disconnected during auth
+        _, msg = receive_framed_msg(client_socket)
+        if not msg: return None# Disconnected during auth
         
         if msg.startswith("CHECK:"):
             check_user = msg.split(":")[1]
             if check_user in postgresql_users:
-                send_framed_msg(client_socket, "EXISTS", 'ACTION')
+                send_framed_msg(client_socket, "EXISTS", 'A')
             else:
-                send_framed_msg(client_socket, "NOT_FOUND", 'ACTION')
+                send_framed_msg(client_socket, "NOT_FOUND", 'A')
                 
         elif msg.startswith("LOGIN:"):
             _, login_user, login_pwd = msg.split(":", 2)
             if postgresql_users.get(login_user) == login_pwd:
                 username = login_user
-                send_framed_msg(client_socket, "SUCCESS", 'ACTION')
+                send_framed_msg(client_socket, "SUCCESS", 'A')
                 break # Exit auth loop!
             else:
-                send_framed_msg(client_socket, "FAIL", 'ACTION')
+                send_framed_msg(client_socket, "FAIL", 'A')
                 
         elif msg.startswith("REG:"):
             _, reg_user, reg_pwd = msg.split(":", 2)
             with db_lock:
                 postgresql_users[reg_user] = reg_pwd
             username = reg_user
-            send_framed_msg(client_socket, "SUCCESS", 'ACTION')
+            send_framed_msg(client_socket, "SUCCESS", 'A')
             break # Exit auth loop!
 
     # Receive the dynamically assigned UDP port after login
@@ -250,6 +251,8 @@ def authenticate_client(client_socket: socket.socket, addr) -> None:
     
     # Immediately flush any offline messages waiting for them
     flush_redis_queue(client_socket, username)
+
+    return username
     
 def start_server() -> None:
     """
