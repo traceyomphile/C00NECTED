@@ -47,14 +47,44 @@ Run the server to start listening for client connections:
 python ARCPServer.py
 ```
 
+If using Conda, activate your environment first:
+
+```bash
+conda activate <your_env_name>
+python ARCPServer.py
+```
+
+Alternatively, you can run it directly with Conda:
+
+```bash
+conda run -n <your_env_name> python ARCPServer.py
+```
+
 The server will start on the local IP address at port 50000.
 
 ### Running the Client
 
-Open a new terminal and run the client:
+Open a new terminal and run the client. On Windows you can also use the `py` launcher:
 
 ```bash
 python Client.py
+# or
+py Client.py
+```
+
+If using Conda, activate your environment first:
+
+```bash
+conda activate <your_env_name>
+python Client.py
+# or
+py Client.py
+```
+
+Alternatively:
+
+```bash
+conda run -n <your_env_name> python Client.py
 ```
 
 The client will prompt for username and password. You can register a new account or login with an existing one.
