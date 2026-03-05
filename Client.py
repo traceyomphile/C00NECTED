@@ -31,7 +31,8 @@ def receive_udp_media(udp_sock: socket.socket) -> None:
     Returns:
         - None. The function runs indefinitely until an EOF signal is received, at which point it closes the socket.
     """
-    output_filename = f"received_{int(time.time())}.jpg" 
+    output_filename = None
+
     try:
         bytes_received = 0
         chunks = {}
@@ -39,6 +40,11 @@ def receive_udp_media(udp_sock: socket.socket) -> None:
         
         while True:
             data, addr = udp_sock.recvfrom(4100)
+
+            if data.startswith(b"FILENAME:"):
+                output_filename = data.decode().split(':', 1)[1]
+                print(f"\n[UDP] Incoming file: {output_filename} from {addr}.")
+                continue
 
             if data.startswith(b"SIZE:"):
                 expected_bytes = int(data.decode().split(':')[1])
@@ -59,6 +65,10 @@ def receive_udp_media(udp_sock: socket.socket) -> None:
             # Stop when full file received
             if bytes_received >= expected_bytes:
                 break
+        
+        # Fallback filename if not provided by sender
+        if output_filename is None:
+            output_filename = f"received_{int(time.time())}.bin"
 
         with open(output_filename, 'wb') as file:
             for i in sorted(chunks.keys()):
@@ -83,10 +93,17 @@ def send_image_udp(filepath, target_ip, target_udp_port) -> None:
     
     try:
         # Open the file in 'rb' (read binary) mode
+        filename = os.path.basename(filepath)
+
         with open(filepath, 'rb') as file:
             file_size = os.path.getsize(filepath)
+
             print(f"[UDP] Preparing to send {file_size} bytes to {target_ip}:{target_udp_port}")
             
+            # Send filename first
+            udp_sock.sendto(f"FILENAME:{filename}".encode(), (target_ip, target_udp_port))
+
+            # Send file size to let the receiver know how much data to expect
             udp_sock.sendto(f"SIZE:{file_size}".encode(), (target_ip, target_udp_port))
 
             bytes_sent = 0
@@ -252,7 +269,7 @@ def print_commands():
         "ADD_TO_GROUP:<group_name>:<user> - Add a user to a group\n"
         "LEAVE_GROUP:<group_name>         - Leave a group\n"
         "SEND_GROUP:<group_name>:<msg>    - Message a group\n"
-        "SENDFILE:<user/group>:<filepath> - P2P Media Transfer\n"
+        "SEND_FILE:<user/group>:<filepath> - P2P Media Transfer\n"
         "COMMANDS                         - Show this help menu\n"
         "EXIT                             - Disconnect\n"
     )
@@ -309,10 +326,10 @@ def start_client() -> None:
         recipient = parts[1]
         data = parts[2] if len(parts) > 2 else ""
 
-        if command == "SENDFILE":
+        if command == "SEND_FILE":
             filepath = data
             if not filepath:
-                print("[ERROR] Format: SENDFILE:<recipient_username/group>:<file_path>")
+                print("[ERROR] Format: SEND_FILE:<recipient_username/group>:<file_path>")
                 continue
             pending_transfers[recipient] = filepath
             send_framed_msg(tcp_sock, f"GET_PEER:{recipient}", 'C')

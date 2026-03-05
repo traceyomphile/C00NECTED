@@ -138,10 +138,10 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         - None
     """
     while True:
-        msg_type, full_message = receive_framed_msg(client_socket)
+        _, full_message = receive_framed_msg(client_socket)
         if not full_message: break
 
-        print(f"[RECEIVED] From {username}: {base64.b64encode(full_message.encode('utf-8'))}") # For encryption
+        #print(f"[RECEIVED] From {username}: {base64.b64encode(full_message.encode('utf-8'))}") # For encryption
         parts = full_message.split(":", 2)
 
         if len(parts) < 2:
