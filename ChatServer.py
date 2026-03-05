@@ -104,7 +104,7 @@ def get_group_peers(group_id: str, exclude_user: str) -> list:
         if group_id in groups:
             for member in groups[group_id]:
                 if member != exclude_user and member in clients:
-                    sock, ip, port = clients[member]
+                    _, ip, port = clients[member]
                     peer_list.append((ip, port))
     return peer_list
 
