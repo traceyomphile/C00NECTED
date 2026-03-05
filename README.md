@@ -1,25 +1,107 @@
 # C00NECTED
-The repo defines a networked chat application called "C00NECTED" for a CSC3002F assignment at the University of Cape Town
 
-Problem 1
-1. TCP Stream Fragmentation (The "amahle" / "Virat Kohli" Issue)
-•	The Problem: When sending text messages through the TCP chat socket, the messages were frequently cut off or split across multiple lines on the receiving end (e.g., "amahle" arriving as "amahl" and "e").
-•	The Technical Cause: TCP is a stream-oriented transport protocol, meaning it guarantees delivery and order, but it does not preserve message boundaries. The recv() buffer was pulling whatever bytes were currently available on the network stack rather than waiting for a complete application-level message.
-•	The Solution: Implemented Message Framing via a Length-Prefix protocol. By prepending a fixed-length header containing the payload size (as specified in the Stage 1 design), the receiving socket was programmed to read exactly the required number of bytes to reassemble the complete message before processing it.
+A networked chat application developed for CSC3002F at the University of Cape Town. This project implements a client-server architecture with peer-to-peer (P2P) media transfer capabilities, supporting direct messaging, group chats, and file sharing.
 
+## Features
 
-PROBLEM 1 SOLUTION
-In your Stage 1, you defined Data messages to carry chat content and media. To make your prototype more "real," let's update the server to broadcast messages so clients can actually talk to each other
+- **User Authentication**: Register new accounts or login with existing credentials.
+- **Direct Messaging**: Send private messages to individual users.
+- **Group Messaging**: Create groups, add members, and send messages to groups.
+- **P2P File Transfer**: Send files directly to users or groups using UDP for efficient media exchange.
+- **Offline Messaging**: Messages are queued for offline users and delivered upon login.
+- **Real-time Communication**: TCP for control messages and UDP for media transfers.
+- **Thread-safe Operations**: Server handles multiple clients concurrently with proper locking.
 
-Update your Server's handle_client function:
+## Architecture
 
-Python
-def broadcast(message, sender_socket):
-    """Sends a message to everyone except the sender"""
-    for user in clients:
-        client_sock, _ = clients[user]
-        if client_sock != sender_socket:
-            try:
-                client_sock.send(message)
-            except:
-                client_sock.close()
+The application consists of three main components:
+
+- **ARCPServer.py**: The main server that handles client connections, authentication, and message routing.
+- **ChatServer.py**: Contains the core logic for managing clients, groups, and message delivery.
+- **Client.py**: The client application that connects to the server and provides the user interface.
+
+### Communication Protocol
+
+- **TCP (Port 50000)**: Used for authentication, control messages, and text chat.
+- **UDP**: Used for P2P file transfers on dynamically assigned ports.
+- **Message Framing**: All TCP messages use a length-prefixed format: `[Type(1 char)][Length(4 chars)][Data]`.
+
+Message Types:
+- `A`: Authentication messages
+- `D`: Data messages (chat content)
+- `C`: Control messages (system notifications, peer info)
+
+## Installation
+
+1. Ensure Python 3.x is installed on your system.
+2. Clone or download the project files.
+3. No additional dependencies are required beyond the standard library.
+
+## Usage
+
+### Starting the Server
+
+Run the server to start listening for client connections:
+
+```bash
+python ARCPServer.py
+```
+
+The server will start on the local IP address at port 50000.
+
+### Running the Client
+
+Open a new terminal and run the client:
+
+```bash
+python Client.py
+```
+
+The client will prompt for username and password. You can register a new account or login with an existing one.
+
+### Commands
+
+Once authenticated, use the following commands in the client interface:
+
+- `SEND:<user>:<message>` - Send a direct message to a user.
+- `CREATE_GROUP:<group_name>` - Create a new group.
+- `ADD_TO_GROUP:<group_name>:<user>` - Add a user to a group.
+- `LEAVE_GROUP:<group_name>` - Leave a group.
+- `SEND_GROUP:<group_name>:<message>` - Send a message to a group.
+- `SEND_FILE:<user/group>:<filepath>` - Send a file to a user or group.
+- `COMMANDS` - Display the help menu.
+- `EXIT` - Disconnect from the server.
+
+### File Transfer
+
+Files are sent via P2P UDP connections. The server facilitates peer discovery, and files are transferred directly between clients.
+
+## Technologies Used
+
+- **Python**: Core programming language.
+- **Sockets**: TCP and UDP for network communication.
+- **Threading**: For concurrent client handling and message processing.
+- **Datetime**: For timestamping messages.
+
+## Known Issues and Solutions
+
+### Problem 1: TCP Stream Fragmentation
+
+**Issue**: Messages were being fragmented during TCP transmission, causing incomplete reception.
+
+**Cause**: TCP is stream-oriented and doesn't preserve message boundaries.
+
+**Solution**: Implemented message framing with a length-prefixed header to ensure complete message assembly before processing.
+
+### Broadcasting Messages
+
+To enable real-time chat, the server broadcasts messages to all connected clients except the sender.
+
+## Authors
+
+- Developed as part of CSC3002F coursework at the University of Cape Town.
+- Date: 2024-06-01
+
+## License
+
+This project is for educational purposes.
