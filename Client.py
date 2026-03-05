@@ -269,7 +269,7 @@ def print_commands():
         "ADD_TO_GROUP:<group_name>:<user> - Add a user to a group\n"
         "LEAVE_GROUP:<group_name>         - Leave a group\n"
         "SEND_GROUP:<group_name>:<msg>    - Message a group\n"
-        "SENDFILE:<user/group>:<filepath> - P2P Media Transfer\n"
+        "SEND_FILE:<user/group>:<filepath> - P2P Media Transfer\n"
         "COMMANDS                         - Show this help menu\n"
         "EXIT                             - Disconnect\n"
     )
