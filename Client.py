@@ -18,8 +18,9 @@ import socket
 import threading
 import os
 import time
+import base64
 
-SERVER_IP = socket.gethostbyname(socket.gethostname())
+SERVER_IP = '196.47.192.177' # socket.gethostbyname(socket.gethostname())
 TCP_PORT = 50000
 UDP_PORT = 0 # Ensures the OS picks a unique port for each client
 
@@ -137,29 +138,21 @@ def send_image_udp(filepath, target_ip, target_udp_port) -> None:
 def send_framed_msg(sock: socket.socket, message: str, msg_type: str='D') -> None:
     """
     Sends a framed message over a TCP socket with a specified message type.
-    Parameters:
-        - sock: The TCP socket through which the message will be sent.
-        - message: The string message to be sent.
-        - msg_type: A single-character indicating the type of message (default is 'D').
-    Returns:
-        - None. The function encodes the message with a header containing the message type and length, and sends it through the socket.
+    UPGRADED to 8-digit header length to support transferring massive files.
     """
     data = message.encode('ascii')
-    header = f"{msg_type}{len(data):04d}".encode('ascii')
+    header = f"{msg_type}{len(data):08d}".encode('ascii')
     sock.sendall(header + data)
 
 def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, None]:
     """
     Receives a framed message from a TCP socket, extracting the message type and content.
-    Parameters:
-        - sock: The TCP socket from which the message will be received.
-    Returns:
-        - A tuple containing the message type (as a string) and the message content (as a string). If the connection is closed, returns (None, None).
+    UPGRADED to handle 9-byte headers (1 char type + 8 chars length).
     """
-    header = sock.recv(5)
+    header = sock.recv(9)
     if not header: return None, None
     msg_type = header[0:1].decode('ascii')
-    msg_len = int(header[1:5].decode('ascii'))
+    msg_len = int(header[1:9].decode('ascii'))
     
     data = b""
     while len(data) < msg_len:
@@ -173,10 +166,6 @@ pending_transfers = {}
 def receive_tcp_messages(sock: socket.socket) -> None:
     """
     Listens for incoming TCP messages and processes them based on their type.
-    Parameters:
-        - sock: The TCP socket through which messages are received.
-    Returns:
-        - None. The function runs indefinitely, processing incoming messages until the connection is lost.
     """
     global pending_transfers
     while True:
@@ -184,7 +173,7 @@ def receive_tcp_messages(sock: socket.socket) -> None:
             msg_type, msg = receive_framed_msg(sock)
             if not msg: break
             
-            # --- P2P: Direct User File Transfer ---
+            # --- P2P: Direct User File Transfer (Online) ---
             if msg_type == 'C' and msg.startswith("PEER_INFO:"):
                 _, target_user, t_ip, t_port = msg.split(':')
                 if target_user in pending_transfers:
@@ -193,17 +182,58 @@ def receive_tcp_messages(sock: socket.socket) -> None:
                     threading.Thread(target=send_image_udp, args=(filepath, t_ip, int(t_port)), daemon=True).start()
                 continue
 
-            # --- P2P: Group Broadcast File Transfer ---
+            # --- P2P: Group Broadcast File Transfer (Online) ---
             if msg_type == 'C' and msg.startswith("GROUP_PEER_INFO:"):
                 parts = msg.split(':', 2)
                 group_name = parts[1]
                 peers_str = parts[2]
                 if group_name in pending_transfers:
-                    filepath = pending_transfers.pop(group_name)
+                    # We copy the filepath so we don't pop it until the TCP upload handles the offline members
+                    filepath = pending_transfers.get(group_name)
                     print(f"\n[SYSTEM] Group members found! Initiating Multicast P2P transfer to '{group_name}'...")
                     for peer_str in peers_str.split('|'):
                         ip, port = peer_str.split(',')
                         threading.Thread(target=send_image_udp, args=(filepath, ip, int(port)), daemon=True).start()
+                continue
+            
+            # --- TCP: Upload File for Offline Users ---
+            if msg_type == 'C' and msg.startswith("UPLOAD_TCP:"):
+                parts = msg.split(':', 3)
+                recipient = parts[1]
+                filename = parts[2]
+                offline_users_str = parts[3]
+                
+                if recipient in pending_transfers:
+                    filepath = pending_transfers.pop(recipient) # Now we pop it since we are done
+                    try:
+                        with open(filepath, "rb") as f:
+                            file_bytes = f.read()
+                            # Encode raw bytes into a safe text format for TCP transmission
+                            b64_data = base64.b64encode(file_bytes).decode('ascii')
+                        
+                        print(f"\n[SYSTEM] Some users are offline. Uploading {filename} to server for offline delivery...")
+                        send_framed_msg(sock, f"STORE_FILE:{filename}:{offline_users_str}:{b64_data}", 'C')
+                    except Exception as e:
+                        print(f"\n[ERROR] Failed to read/upload file: {e}")
+                continue
+
+            # --- TCP: Receive Buffered File (Just Logged In) ---
+            if msg_type == 'F' and msg.startswith("DELIVER_FILE:"):
+                parts = msg.split(':', 3)
+                sender = parts[1]
+                filename = parts[2]
+                b64_data = parts[3]
+                
+                print(f"\n[SYSTEM] Received buffered offline file '{filename}' from {sender}.")
+                try:
+                    # Decode the text format back into raw binary file data
+                    file_bytes = base64.b64decode(b64_data)
+                    out_name = f"offline_{int(time.time())}_{filename}"
+                    with open(out_name, "wb") as f:
+                        f.write(file_bytes)
+                    print(f"[SYSTEM] Offline file saved as {out_name}")
+                except Exception as e:
+                    print(f"\n[ERROR] Failed to decode/save offline file: {e}")
                 continue
             
             print(f"\n{msg}")
@@ -214,10 +244,6 @@ def receive_tcp_messages(sock: socket.socket) -> None:
 def authenticate_console(tcp_sock: socket.socket) -> str | None:
     """
     Handles the interactive console registration/login logic.
-    Parameters:
-        - tcp_sock: The TCP socket through which authentication messages are sent and received.
-    Returns:
-        - The authenticated username as a string if login/registration is successful, or None if the user chooses to exit or authentication fails.
     """
     while True:
         username = input("Enter username: ").strip()
@@ -268,8 +294,8 @@ def print_commands():
         "CREATE_GROUP:<group_name>        - Create a new group\n"
         "ADD_TO_GROUP:<group_name>:<user> - Add a user to a group\n"
         "LEAVE_GROUP:<group_name>         - Leave a group\n"
-        "SEND_TO_GROUP:<group_name>:<msg>    - Message a group\n"
-        "SEND_FILE:<user/group>:<filepath> - P2P Media Transfer\n"
+        "SEND_TO_GROUP:<group_name>:<msg> - Message a group\n"
+        "SEND_FILE:<user/group>:<filepath>- P2P Media Transfer\n"
         "COMMANDS                         - Show this help menu\n"
         "EXIT                             - Disconnect\n"
     )
@@ -340,11 +366,12 @@ def start_client() -> None:
                 continue
             send_framed_msg(tcp_sock, f"SEND:{recipient}:{data}", 'D')
             
-        elif command == "SEND_TO_GROUP":
+        elif command in ["SEND_GROUP", "SEND_TO_GROUP"]:
             if not data:
                 print("[ERROR] Format: SEND_TO_GROUP:<group_name>:<message>")
                 continue
-            send_framed_msg(tcp_sock, f"SEND_TO_GROUP:{recipient}:{data}", 'D')
+            # Force standard protocol format for the server
+            send_framed_msg(tcp_sock, f"SEND_GROUP:{recipient}:{data}", 'D')
 
         elif command in ["CREATE_GROUP", "LEAVE_GROUP"]:
             send_framed_msg(tcp_sock, f"{command}:{recipient}", 'C')
