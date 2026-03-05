@@ -2,15 +2,6 @@
 ARCP Server Implementation
 This module implements the ARCP server that handles client authentication, peer discovery, direct messaging, group chat management, and offline message queuing.
 The server listens for incoming TCP connections from clients, processes framed messages according to the defined protocol, and maintains global data structures for user management and message routing. It also ensures thread-safe access to shared resources using locks.
-Functions:
-- send_framed_msg: Frames a message with a header and sends it over a socket.
-- receive_framed_msg: Receives a framed message and returns the type and content.
-- queue_offline_message: Helper function to append a message to a user's offline queue.
-- flush_redis_queue: Checks for queued messages for a recipient and sends them upon login.
-- handle_client: Manages the lifecycle of a client connection, including authentication and message processing.
-- main_chat_loop: Processes incoming messages from the client after authentication.
-- authenticate_client: Handles the authentication process for a new client connection.
-- start_server: Initializes the TCP server and listens for incoming client connections.
 Date: 2026-03-05
 """
 
@@ -39,32 +30,22 @@ redis_message_queue: dict[str, list[str]] = {}
 def send_framed_msg(sock: socket.socket, message: str, msg_type: str = 'D') -> None:
     """
     Frames a message with a header and sends it over the socket.
-    Header Format: [Type (1 char)][Length (4 chars)]
-    Parameters:
-        - sock: The socket to send the message through.
-        - message: The content of the message to send.
-        - msg_type: A single-character indicating the type of message (e.g., 'D', 'C', 'A').
-    Returns:
-        - None
+    UPGRADED to 8-digit length header to support large file buffering.
+    Header Format: [Type (1 char)][Length (8 chars)]
     """
     data = message.encode('ascii')
-    header = f"{msg_type}{len(data):04d}".encode('ascii')
+    header = f"{msg_type}{len(data):08d}".encode('ascii')
     sock.sendall(header + data)
 
 def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, None]:
     """
     Receives a framed message and returns the type and content.
-    Expects the same header format as send_framed_msg.
-    Parameters:
-        - sock: The socket to read from.
-    Returns:
-        - msg_type: The type of the message (e.g., 'D', 'C', 'A').
-        - message: The content of the message as a string.
+    UPGRADED to read 9 byte headers (1 char type + 8 chars length).
     """
-    header = sock.recv(5)
+    header = sock.recv(9)
     if not header: return None, None
     msg_type = header[0:1].decode('ascii')
-    msg_len = int(header[1:5].decode('ascii'))
+    msg_len = int(header[1:9].decode('ascii'))
     
     data = b""
     while len(data) < msg_len:
@@ -74,23 +55,12 @@ def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, Non
     return msg_type, data.decode('ascii')
 
 def queue_offline_message(recipient: str, formatted_msg: str) -> None:
-    """
-    Helper function to append a message to a user's offline queue.
-    """
     with db_lock:
         if recipient not in redis_message_queue:
             redis_message_queue[recipient] = []
         redis_message_queue[recipient].append(formatted_msg)
 
 def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
-    """
-    Checks if there are any queued messages for the recipient in the Redis queue and sends them sequentially.
-    Parameters:
-        - client_socket: The socket to send the queued messages through.
-        - recipient: The username of the recipient to check for queued messages.
-    Returns:
-        - None
-    """
     with db_lock:
         if recipient not in redis_message_queue:
             return
@@ -99,24 +69,19 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
             send_framed_msg(client_socket, msg, 'D')
         del redis_message_queue[recipient]
 
+def flush_offline_files(client_socket: socket.socket, recipient: str) -> None:
+    """Retrieves buffered TCP files and sends them to the newly logged-in user."""
+    files = ChatServer.get_and_clear_offline_files(recipient)
+    for sender, filename, b64_data in files:
+        # Deliver via TCP using the new 'F' (File) message type
+        send_framed_msg(client_socket, f"DELIVER_FILE:{sender}:{filename}:{b64_data}", 'F')
+
 def handle_client(client_socket: socket.socket, addr) -> None:
-    """
-    Handles the lifecycle of a client connection, including authentication and message processing.
-    Parameters:
-        - client_socket: The socket representing the client's connection.
-        - addr: The address of the client.
-    Returns:
-        - None
-    """
     username = None
     try:
-        # Authenticate user and register in clients dict
         username = authenticate_client(client_socket, addr)
-
         if not username:
-            return # Authentication failed or client disconnected
-        
-        # Implement chat logic
+            return 
         main_chat_loop(client_socket, username)
                             
     except Exception as e:
@@ -129,14 +94,6 @@ def handle_client(client_socket: socket.socket, addr) -> None:
                 print(f"[DISCONNECTED] {username}")
 
 def main_chat_loop(client_socket: socket.socket, username: str) -> None:
-    """
-    Main loop to process incoming messages from the client after authentication.
-    Parameter:
-        - client_socket: The socket representing the client's connection.
-        - username: The authenticated username of the client.
-    Returns:
-        - None
-    """
     while True:
         _, full_message = receive_framed_msg(client_socket)
         if not full_message: break
@@ -151,11 +108,9 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         recipient = parts[1]
         data = parts[2] if len(parts) > 2 else ""
 
-        # FEATURE: Server logs routing info, but remains BLIND to the message payload data
         print(f"[ROUTING] {command} from '{username}' to '{recipient}'")
 
         if command == "SEND":
-            # FEATURE: Prevent sending messages to non-existent users
             if recipient not in postgresql_users:
                 send_framed_msg(client_socket, f"ERROR: User '{recipient}' does not exist in the system.", 'C')
                 continue
@@ -163,7 +118,6 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             target_online = ChatServer.get_peer_info(recipient) is not None
             ChatServer.send_dm(username, recipient, data, send_framed_msg, queue_offline_message)
             
-            # FEATURE: Delivery Notification OR Last Seen feedback
             if target_online:
                 send_framed_msg(client_socket, f"[SYSTEM] Message delivered to '{recipient}'.", 'C')
             else:
@@ -171,7 +125,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 sys_msg = f"[SYSTEM] Message sent. User '{recipient}' is currently offline. Last seen at {last_seen_time}."
                 send_framed_msg(client_socket, sys_msg, 'C')
 
-        elif command == "SEND_TO_GROUP":
+        elif command == "SEND_GROUP":
             status = ChatServer.send_group_message(username, recipient, data, send_framed_msg, queue_offline_message)
             if status != "SUCCESS":
                 send_framed_msg(client_socket, f"ERROR: {status}", 'C')
@@ -182,20 +136,15 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             send_framed_msg(client_socket, msg, 'C')
 
         elif command == "ADD_TO_GROUP":
-            # 'data' holds the target username to add
             status = ChatServer.add_to_group(recipient, username, data)
-            
-            # Feature: System Notification for Added User
             if status == "SUCCESS":
                 sys_msg = f"You were added to group '{recipient}' by {username}."
                 ChatServer.send_dm("SYSTEM", data, sys_msg, send_framed_msg, queue_offline_message)
-                
             send_framed_msg(client_socket, f"ADD_STATUS: {status}", 'C')
 
         elif command == "LEAVE_GROUP":
             left = ChatServer.leave_group(recipient, username)
             if left:
-                # Feature: System Notification for Remaining Members
                 sys_msg = f"{username} has left the group."
                 ChatServer.send_group_message("SYSTEM", recipient, sys_msg, send_framed_msg, queue_offline_message)
                 send_framed_msg(client_socket, "LEFT GROUP", 'C')
@@ -204,54 +153,58 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
 
         elif command == "GET_PEER":
             peer = ChatServer.get_peer_info(recipient)
-            filename = data if data else "a file" # Extract the filename from the new client format
+            filename = data if data else "a file" 
 
             if peer:
-                # Target is an individual online user
                 _, ip, port = peer
                 response = f"PEER_INFO:{recipient}:{ip}:{port}"
                 send_framed_msg(client_socket, response, 'C')
             else:
-                # Feature: Group File Sharing Support
                 if ChatServer.is_group(recipient):
-                    # THE FIX: Get both online peers and offline members
                     online_peers, offline_members = ChatServer.get_group_presence(recipient, exclude_user=username)
                     
-                    # 1. Queue notifications for the offline members
-                    for offline_user in offline_members:
-                        sys_msg = f"[{ChatServer.get_timestamp()}] [SYSTEM] {username} sent '{filename}' to group '{recipient}' while you were offline."
-                        queue_offline_message(offline_user, sys_msg)
+                    # Instead of queuing a text notification, we instruct the client to upload the file to the server for offline members
+                    if offline_members:
+                        # Convert list of offline users into a comma-separated string to tell the client who to upload it for
+                        offline_str = ",".join(offline_members)
+                        send_framed_msg(client_socket, f"UPLOAD_TCP:{recipient}:{filename}:{offline_str}", 'C')
 
-                    # 2. Give the sender the IPs of the online members
                     if online_peers:
                         peers_str = "|".join([f"{ip},{port}" for ip, port in online_peers])
                         response = f"GROUP_PEER_INFO:{recipient}:{peers_str}"
                         send_framed_msg(client_socket, response, 'C')
-                    else:
-                        send_framed_msg(client_socket, f"ERROR: No other members online in group {recipient}. File not sent.", 'C')
+                    elif not offline_members:
+                        send_framed_msg(client_socket, f"ERROR: No members exist in group {recipient}.", 'C')
                 else:
-                    # Feature: Prevent sending files to non-existent users
                     if recipient not in postgresql_users:
                         send_framed_msg(client_socket, f"ERROR: User '{recipient}' does not exist in the system.", 'C')
                     else:
-                        last_seen_time = ChatServer.get_last_seen(recipient)
-                        send_framed_msg(client_socket, f"ERROR: User '{recipient}' is OFFLINE. Last seen at {last_seen_time}", 'C')
+                        # Recipient is offline. Tell client to upload it to the server!
+                        send_framed_msg(client_socket, f"UPLOAD_TCP:{recipient}:{filename}:{recipient}", 'C')
+
+        # NEW COMMAND: Client uploads the file to the server for storage
+        elif command == "STORE_FILE":
+            file_parts = data.split(":", 2)
+            if len(file_parts) == 3:
+                filename = file_parts[0]
+                offline_users_str = file_parts[1]
+                b64_data = file_parts[2]
+                
+                # The client might have uploaded it for a whole group of offline users
+                for offline_user in offline_users_str.split(","):
+                    ChatServer.queue_offline_file(offline_user, username, filename, b64_data)
+                
+                send_framed_msg(client_socket, f"[SYSTEM] File '{filename}' safely stored on server for offline delivery.", 'C')
+            else:
+                send_framed_msg(client_socket, "ERROR: Invalid STORE_FILE format.", 'C')
         
         else:
             send_framed_msg(client_socket, "ERROR: UNKNOWN COMMAND.", 'C')
 
 def authenticate_client(client_socket: socket.socket, addr) -> str | None:
-    """
-    Handles the authentication process for a new client connection.
-    Parameters:
-        - client_socket: The socket representing the client's connection.
-        - addr: The address of the client.
-    Returns:
-        - The authenticated username, or None if authentication fails.
-    """
     while True:
         _, msg = receive_framed_msg(client_socket)
-        if not msg: return None# Disconnected during auth
+        if not msg: return None
         
         if msg.startswith("CHECK:"):
             check_user = msg.split(":")[1]
@@ -273,8 +226,7 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
 
             username = login_user
             send_framed_msg(client_socket, "SUCCESS", 'A')
-            break # Exit auth loop!
-                
+            break 
                 
         elif msg.startswith("REG:"):
             _, reg_user, reg_pwd = msg.split(":", 2)
@@ -288,26 +240,21 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
 
             username = reg_user
             send_framed_msg(client_socket, "SUCCESS", 'A')
-            break # Exit auth loop!
+            break 
 
-    # Receive the dynamically assigned UDP port after login
     _, port_msg = receive_framed_msg(client_socket)
     udp_port = int(port_msg.split(":")[1])
     
-    # Register with the Global ChatServer logic
     ChatServer.register_client(username, client_socket, addr[0], udp_port)
     print(f"[REGISTERED] {username} at {addr[0]}:{udp_port}")
     
-    # Immediately flush any offline messages waiting for them
     flush_redis_queue(client_socket, username)
+    # NEW: Deliver any buffered files immediately after text messages!
+    flush_offline_files(client_socket, username)
 
     return username
     
 def start_server() -> None:
-    """
-    Initializes the TCP server and listens for incoming client connections.
-    For each accepted connection, it spawns a new thread to handle the client.
-    """
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind((HOST, PORT))
     server.listen()
