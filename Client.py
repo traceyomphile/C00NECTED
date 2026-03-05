@@ -211,27 +211,27 @@ def receive_tcp_messages(sock: socket.socket) -> None:
                             # Encode raw bytes into a safe text format for TCP transmission
                             b64_data = base64.b64encode(file_bytes).decode('ascii')
                         
-                        print(f"\n[SYSTEM] Some users are offline. Uploading {filename} to server for offline delivery...")
-                        send_framed_msg(sock, f"STORE_FILE:{filename}:{offline_users_str}:{b64_data}", 'C')
+                        send_framed_msg(sock, f"STORE_FILE:{filename}:{offline_users_str}:{b64_data}", 'B')
                     except Exception as e:
                         print(f"\n[ERROR] Failed to read/upload file: {e}")
                 continue
 
-            # --- TCP: Receive Buffered File (Just Logged In) ---
-            if msg_type == 'F' and msg.startswith("DELIVER_FILE:"):
+            # --- TCP: Receive File From Server (Online or Buffered) ---
+            if msg_type == 'B' and msg.startswith("FILE_FROM:"):
                 parts = msg.split(':', 3)
                 sender = parts[1]
                 filename = parts[2]
                 b64_data = parts[3]
                 
-                print(f"\n[SYSTEM] Received buffered offline file '{filename}' from {sender}.")
+                print(f"\n[SYSTEM] Received file '{filename}' from {sender}.")
                 try:
                     # Decode the text format back into raw binary file data
                     file_bytes = base64.b64decode(b64_data)
-                    out_name = f"offline_{int(time.time())}_{filename}"
+                    out_name = f"received_{int(time.time())}_{filename}"
+
                     with open(out_name, "wb") as f:
                         f.write(file_bytes)
-                    print(f"[SYSTEM] Offline file saved as {out_name}")
+                    print(f"[SYSTEM] File saved as {out_name}")
                 except Exception as e:
                     print(f"\n[ERROR] Failed to decode/save offline file: {e}")
                 continue
@@ -366,7 +366,7 @@ def start_client() -> None:
                 continue
             send_framed_msg(tcp_sock, f"SEND:{recipient}:{data}", 'D')
             
-        elif command in ["SEND_GROUP", "SEND_TO_GROUP"]:
+        elif command in ["SEND_TO_GROUP"]:
             if not data:
                 print("[ERROR] Format: SEND_TO_GROUP:<group_name>:<message>")
                 continue

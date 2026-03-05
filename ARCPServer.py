@@ -125,7 +125,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 sys_msg = f"[SYSTEM] Message sent. User '{recipient}' is currently offline. Last seen at {last_seen_time}."
                 send_framed_msg(client_socket, sys_msg, 'C')
 
-        elif command == "SEND_GROUP":
+        elif command == "SEND_TO_GROUP":
             status = ChatServer.send_group_message(username, recipient, data, send_framed_msg, queue_offline_message)
             if status != "SUCCESS":
                 send_framed_msg(client_socket, f"ERROR: {status}", 'C')
@@ -140,6 +140,11 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             if status == "SUCCESS":
                 sys_msg = f"You were added to group '{recipient}' by {username}."
                 ChatServer.send_dm("SYSTEM", data, sys_msg, send_framed_msg, queue_offline_message)
+
+                # Notify existing group members about the new addition
+                notify_msg = f"{data} has been added to the group by {username}."
+                ChatServer.send_group_message("SYSTEM", recipient, notify_msg, send_framed_msg, queue_offline_message)
+
             send_framed_msg(client_socket, f"ADD_STATUS: {status}", 'C')
 
         elif command == "LEAVE_GROUP":
@@ -184,17 +189,25 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
 
         # NEW COMMAND: Client uploads the file to the server for storage
         elif command == "STORE_FILE":
-            file_parts = data.split(":", 2)
-            if len(file_parts) == 3:
-                filename = file_parts[0]
-                offline_users_str = file_parts[1]
-                b64_data = file_parts[2]
-                
-                # The client might have uploaded it for a whole group of offline users
-                for offline_user in offline_users_str.split(","):
-                    ChatServer.queue_offline_file(offline_user, username, filename, b64_data)
-                
-                send_framed_msg(client_socket, f"[SYSTEM] File '{filename}' safely stored on server for offline delivery.", 'C')
+            filename = recipient  # In this context, 'recipient' actually contains the filename
+            file_parts = data.split(":", 1)
+            
+            if len(file_parts) == 2:
+                b64_data = file_parts[1]
+
+                users = file_parts[0].split(",")
+
+                for user in users:
+                    # If user is online -> deliver immediately, otherwise queue for offline delivery
+
+                    if user in ChatServer.clients:
+                        target_socket = ChatServer.clients[user]["socket"]
+
+                        send_framed_msg(target_socket, f"FILE_FROM:{username}:{filename}:{b64_data}", 'B')
+
+                    else:
+                        ChatServer.queue_offline_file(user, username, filename, b64_data)
+                        send_framed_msg(client_socket, f"[SYSTEM] User '{user}' is offline. File '{filename}' stored for offline delivery.", 'C')
             else:
                 send_framed_msg(client_socket, "ERROR: Invalid STORE_FILE format.", 'C')
         
