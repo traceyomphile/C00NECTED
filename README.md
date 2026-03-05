@@ -130,6 +130,7 @@ To enable real-time chat, the server broadcasts messages to all connected client
 ## Authors
 
 - Developed as part of CSC3002F coursework at the University of Cape Town.
+- Karabo Nkambule, Tracey Letlape, Amahle Mbambo
 - Date: 2024-06-01
 
 ## License
