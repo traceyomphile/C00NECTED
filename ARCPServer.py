@@ -98,13 +98,14 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         _, full_message = receive_framed_msg(client_socket)
         if not full_message: break
 
+        print(f"[RECEIVED] {full_message} from {username}")
         parts = full_message.split(":", 2)
 
         if len(parts) < 2:
             send_framed_msg(client_socket, "ERROR: Invalid message format.", 'C')
             continue
 
-        command = parts[0]
+        command = parts[0].strip()
         recipient = parts[1]
         data = parts[2] if len(parts) > 2 else ""
 
