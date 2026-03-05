@@ -13,7 +13,7 @@ Functions:
 - add_to_group: Adds a user to an existing group, ensuring the adder is already a member.
 - leave_group: Removes a user from a group and cleans up empty groups.
 - send_group_message: Sends a message to all members of a group except the sender, queuing for offline members.
-Date: 2024-06-01
+Date: 2026-03-05
 """
 
 from threading import Lock

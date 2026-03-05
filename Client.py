@@ -11,7 +11,7 @@ Functions:
 - authenticate_console: Handles the interactive console registration/login logic.
 - print_commands: Displays the interactive help menu.
 - start_client: Initializes the client, manages authentication, and starts the main chat interface.
-Date: 2024-06-01
+Date: 2026-03-05
 """
 
 import socket
@@ -25,7 +25,7 @@ UDP_PORT = 0 # Ensures the OS picks a unique port for each client
 
 def receive_udp_media(udp_sock: socket.socket) -> None:
     """
-    Listens for incoming UDP datagrams and writes them to a file until an EOF signal is received.
+    Listens for incoming UDP datagrams and writes them to a file until an End-Of-File(EOF) signal is received.
     Parameters:
         - udp_sock: The UDP socket bound to the client's unique port for receiving media.
     Returns:
@@ -268,7 +268,7 @@ def print_commands():
         "CREATE_GROUP:<group_name>        - Create a new group\n"
         "ADD_TO_GROUP:<group_name>:<user> - Add a user to a group\n"
         "LEAVE_GROUP:<group_name>         - Leave a group\n"
-        "SEND_GROUP:<group_name>:<msg>    - Message a group\n"
+        "SEND_TO_GROUP:<group_name>:<msg>    - Message a group\n"
         "SEND_FILE:<user/group>:<filepath> - P2P Media Transfer\n"
         "COMMANDS                         - Show this help menu\n"
         "EXIT                             - Disconnect\n"
@@ -340,11 +340,11 @@ def start_client() -> None:
                 continue
             send_framed_msg(tcp_sock, f"SEND:{recipient}:{data}", 'D')
             
-        elif command == "SEND_GROUP":
+        elif command == "SEND_TO_GROUP":
             if not data:
-                print("[ERROR] Format: SEND_GROUP:<group_name>:<message>")
+                print("[ERROR] Format: SEND_TO_GROUP:<group_name>:<message>")
                 continue
-            send_framed_msg(tcp_sock, f"SEND_GROUP:{recipient}:{data}", 'D')
+            send_framed_msg(tcp_sock, f"SEND_TO_GROUP:{recipient}:{data}", 'D')
 
         elif command in ["CREATE_GROUP", "LEAVE_GROUP"]:
             send_framed_msg(tcp_sock, f"{command}:{recipient}", 'C')

@@ -172,7 +172,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 sys_msg = f"[SYSTEM] Message sent. User '{recipient}' is currently offline. Last seen at {last_seen_time}."
                 send_framed_msg(client_socket, sys_msg, 'C')
 
-        elif command == "SEND_GROUP":
+        elif command == "SEND_TO_GROUP":
             status = ChatServer.send_group_message(username, recipient, data, send_framed_msg, queue_offline_message)
             if status != "SUCCESS":
                 send_framed_msg(client_socket, f"ERROR: {status}", 'C')
