@@ -14,6 +14,8 @@ Functions:
 - add_to_group: Adds a user to an existing group, ensuring the adder is already a member.
 - leave_group: Removes a user from a group and cleans up empty groups.
 - send_group_message: Sends a message to all members of a group except the sender, queuing for offline members.
+- queue_offline_file: Stores a file in memory for an offline user.
+- get_and_clear_offline_files: Retrieves and deletes stored files when a user logs in.
 Date: 2026-03-05
 """
 
@@ -24,6 +26,7 @@ from datetime import datetime
 clients = {}
 last_seen = {} # Tracks when users disconnect: username -> timestamp
 groups = {} # group_id -> set of usernames
+offline_files = {} # recipient -> list of (sender, filename, base64_data)
 clients_lock: Lock = Lock()
 
 def get_timestamp() -> str:
@@ -130,6 +133,22 @@ def get_group_presence(group_id: str, exclude_user: str) -> tuple[list, list]:
                     else:
                         offline_members.append(member)
     return online_peers, offline_members
+
+def queue_offline_file(recipient: str, sender: str, filename: str, file_data: str) -> None:
+    """Stores a file in memory for an offline user."""
+    with clients_lock:
+        if recipient not in offline_files:
+            offline_files[recipient] = []
+        offline_files[recipient].append((sender, filename, file_data))
+
+def get_and_clear_offline_files(username: str) -> list:
+    """Retrieves and deletes stored files when a user logs in."""
+    with clients_lock:
+        if username in offline_files:
+            files = offline_files[username]
+            del offline_files[username]
+            return files
+        return []
 
 def send_dm(sender: str, target: str, content: str, send_func: callable, queue_func: callable) -> bool:
     """
