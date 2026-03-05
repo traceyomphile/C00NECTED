@@ -33,7 +33,7 @@ postgresql_users: dict[str, str] = {
     "tracy": "testpass"
 }
 
-# Updated Dictionary: recipient -> [formatted_message_string, ...]
+# Dictionary for Offline Queue: recipient -> [formatted_message_string, ...]
 redis_message_queue: dict[str, list[str]] = {} 
 
 def send_framed_msg(sock: socket.socket, message: str, msg_type: str = 'D') -> None:
@@ -152,21 +152,27 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         recipient = parts[1]
         data = parts[2] if len(parts) > 2 else ""
 
+        # FEATURE: Server logs routing info, but remains BLIND to the message payload data
+        print(f"[ROUTING] {command} from '{username}' to '{recipient}'")
+
         if command == "SEND":
-            # Check if target is online before sending to provide Last Seen feedback
+            # FEATURE: Prevent sending messages to non-existent users
+            if recipient not in postgresql_users:
+                send_framed_msg(client_socket, f"ERROR: User '{recipient}' does not exist in the system.", 'C')
+                continue
+
             target_online = ChatServer.get_peer_info(recipient) is not None
-            
-            # Handles Direct Messages & Offline Queuing
             ChatServer.send_dm(username, recipient, data, send_framed_msg, queue_offline_message)
             
-            # Feature: Friendly Last Seen notification
-            if not target_online:
+            # FEATURE: Delivery Notification OR Last Seen feedback
+            if target_online:
+                send_framed_msg(client_socket, f"[SYSTEM] Message delivered to '{recipient}'.", 'C')
+            else:
                 last_seen_time = ChatServer.get_last_seen(recipient)
                 sys_msg = f"[SYSTEM] Message sent. User '{recipient}' is currently offline. Last seen at {last_seen_time}."
                 send_framed_msg(client_socket, sys_msg, 'C')
 
         elif command == "SEND_GROUP":
-            # Handles Group Messages
             status = ChatServer.send_group_message(username, recipient, data, send_framed_msg, queue_offline_message)
             if status != "SUCCESS":
                 send_framed_msg(client_socket, f"ERROR: {status}", 'C')
@@ -183,7 +189,6 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             # Feature: System Notification for Added User
             if status == "SUCCESS":
                 sys_msg = f"You were added to group '{recipient}' by {username}."
-                # We send this as a DM from "SYSTEM" so it queues if they are offline
                 ChatServer.send_dm("SYSTEM", data, sys_msg, send_framed_msg, queue_offline_message)
                 
             send_framed_msg(client_socket, f"ADD_STATUS: {status}", 'C')
@@ -217,8 +222,12 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                     else:
                         send_framed_msg(client_socket, f"ERROR: No other members online in group {recipient}.", 'C')
                 else:
-                    last_seen_time = ChatServer.get_last_seen(recipient)
-                    send_framed_msg(client_socket, f"ERROR: User OFFLINE. Last seen at {last_seen_time}", 'C')
+                    # Feature: Prevent sending files to non-existent users
+                    if recipient not in postgresql_users:
+                        send_framed_msg(client_socket, f"ERROR: User '{recipient}' does not exist in the system.", 'C')
+                    else:
+                        last_seen_time = ChatServer.get_last_seen(recipient)
+                        send_framed_msg(client_socket, f"ERROR: User '{recipient}' is OFFLINE. Last seen at {last_seen_time}", 'C')
         
         else:
             send_framed_msg(client_socket, "ERROR: UNKNOWN COMMAND.", 'C')
