@@ -11,7 +11,7 @@ Functions:
 - main_chat_loop: Processes incoming messages from the client after authentication.
 - authenticate_client: Handles the authentication process for a new client connection.
 - start_server: Initializes the TCP server and listens for incoming client connections.
-Date: 2024-06-01
+Date: 2026-03-05
 """
 
 import socket
@@ -141,7 +141,6 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         _, full_message = receive_framed_msg(client_socket)
         if not full_message: break
 
-        #print(f"[RECEIVED] From {username}: {base64.b64encode(full_message.encode('utf-8'))}") # For encryption
         parts = full_message.split(":", 2)
 
         if len(parts) < 2:
@@ -205,6 +204,8 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
 
         elif command == "GET_PEER":
             peer = ChatServer.get_peer_info(recipient)
+            filename = data if data else "a file" # Extract the filename from the new client format
+
             if peer:
                 # Target is an individual online user
                 _, ip, port = peer
@@ -213,14 +214,21 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             else:
                 # Feature: Group File Sharing Support
                 if ChatServer.is_group(recipient):
-                    peers = ChatServer.get_group_peers(recipient, exclude_user=username)
-                    if peers:
-                        # Format: "ip1,port1|ip2,port2|ip3,port3"
-                        peers_str = "|".join([f"{ip},{port}" for ip, port in peers])
+                    # THE FIX: Get both online peers and offline members
+                    online_peers, offline_members = ChatServer.get_group_presence(recipient, exclude_user=username)
+                    
+                    # 1. Queue notifications for the offline members
+                    for offline_user in offline_members:
+                        sys_msg = f"[{ChatServer.get_timestamp()}] [SYSTEM] {username} sent '{filename}' to group '{recipient}' while you were offline."
+                        queue_offline_message(offline_user, sys_msg)
+
+                    # 2. Give the sender the IPs of the online members
+                    if online_peers:
+                        peers_str = "|".join([f"{ip},{port}" for ip, port in online_peers])
                         response = f"GROUP_PEER_INFO:{recipient}:{peers_str}"
                         send_framed_msg(client_socket, response, 'C')
                     else:
-                        send_framed_msg(client_socket, f"ERROR: No other members online in group {recipient}.", 'C')
+                        send_framed_msg(client_socket, f"ERROR: No other members online in group {recipient}. File not sent.", 'C')
                 else:
                     # Feature: Prevent sending files to non-existent users
                     if recipient not in postgresql_users:
