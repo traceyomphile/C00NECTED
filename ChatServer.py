@@ -8,6 +8,7 @@ Functions:
 - get_last_seen: Fetches the exact timestamp a user disconnected.
 - is_group: Checks if a target ID is a registered group.
 - get_group_peers: Retrieves the IPs and ports of all online group members for P2P multicasting.
+- get_group_presence: Finds both online and offline members of a group for P2P file transfers and system notifications.
 - send_dm: Sends a direct message from sender to target if the target is online, or queues it if offline.
 - create_group: Creates a new group with the specified group_id and adds the creator as the first member.
 - add_to_group: Adds a user to an existing group, ensuring the adder is already a member.
@@ -107,6 +108,28 @@ def get_group_peers(group_id: str, exclude_user: str) -> list:
                     _, ip, port = clients[member]
                     peer_list.append((ip, port))
     return peer_list
+
+def get_group_presence(group_id: str, exclude_user: str) -> tuple[list, list]:
+    """
+    Finds both online and offline members of a group for P2P transfers and system notifications.
+    Parameters:
+        - group_id: The unique identifier for the group.
+        - exclude_user: The username of the sender to exclude from the results.
+    Returns:
+        - A tuple containing a list of online peers [(ip, port), ...] and a list of offline usernames [username, ...].
+    """
+    online_peers = []
+    offline_members = []
+    with clients_lock:
+        if group_id in groups:
+            for member in groups[group_id]:
+                if member != exclude_user:
+                    if member in clients:
+                        _, ip, port = clients[member]
+                        online_peers.append((ip, port))
+                    else:
+                        offline_members.append(member)
+    return online_peers, offline_members
 
 def send_dm(sender: str, target: str, content: str, send_func: callable, queue_func: callable) -> bool:
     """
