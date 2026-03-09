@@ -1,5 +1,6 @@
 """
 ARCP Server Implementation
+
 This module implements the ARCP server that handles client authentication, peer discovery, direct messaging, group chat management, and offline message queuing.
 The server listens for incoming TCP connections from clients, processes framed messages according to the defined protocol, and maintains global data structures for user management and message routing. It also ensures thread-safe access to shared resources using locks.
 Functions:
@@ -11,6 +12,11 @@ Functions:
 - main_chat_loop: Processes incoming messages from the client after authentication.
 - authenticate_client: Handles the authentication process for a new client connection.
 - start_server: Initializes the TCP server and listens for incoming client connections.
+
+Integrations:
+- PostgreSQL: persistent user storage
+- Redis: offline message queue and user presence
+- Google Cloud Storage: media storage
 Date: 2024-06-01
 """
 
@@ -18,6 +24,7 @@ import socket
 import threading
 import ChatServer
 import base64
+from infrastructure import pg_conn, redis_client, bucket
 
 # Server Configuration
 HOST = socket.gethostbyname(socket.gethostname())
@@ -25,13 +32,6 @@ PORT = 50000
 
 # Global Data Structures
 db_lock: threading.Lock = threading.Lock()
-
-postgresql_users: dict[str, str] = {
-    "kb": "password123",
-    "amahle": "securepass",
-    "jacques": "cricketGOAT",
-    "tracy": "testpass"
-}
 
 # Dictionary for Offline Queue: recipient -> [formatted_message_string, ...]
 redis_message_queue: dict[str, list[str]] = {} 
@@ -63,24 +63,47 @@ def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, Non
     """
     header = sock.recv(5)
     if not header: return None, None
+
     msg_type = header[0:1].decode('ascii')
     msg_len = int(header[1:5].decode('ascii'))
     
-    data = b""
+    data = b''
+
     while len(data) < msg_len:
         packet = sock.recv(msg_len - len(data))
+
         if not packet: break
         data += packet
+
     return msg_type, data.decode('ascii')
 
+# ----------------------
+# POSTGRESQL FUNCTIONS
+# ----------------------
+
+def user_exists(username: str) -> bool:
+    with PG_SQL_CON.cursor() as cur:
+        cur.execute("SELECT 1 FROM users WHERE username=%s", (username,))
+        return cur.fetchone() is not None
+    
+def auth_user(username: str, password: str) -> bool:
+    with PG_SQL_CON.cursor as cur:
+        cur.execute("SELECT password FROM users WHERE username=%s", (username,))
+
+        row = cur.fetchone()
+        return row and row[0] == password
+    
+def register_user(username: str, password: str):
+    with PG_SQL_CON.cursor() as cur:
+        cur.execute("INSERT INTO users(username, password) VALUES(%s, %s)", (username, password))
+        PG_SQL_CON.commit()
+
+# --------------------
+# REDIS OFFLINE QUEUE
+# --------------------
+
 def queue_offline_message(recipient: str, formatted_msg: str) -> None:
-    """
-    Helper function to append a message to a user's offline queue.
-    """
-    with db_lock:
-        if recipient not in redis_message_queue:
-            redis_message_queue[recipient] = []
-        redis_message_queue[recipient].append(formatted_msg)
+    redis_client.rpush(f"offline:{recipient}", formatted_msg)
 
 def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
     """
@@ -91,13 +114,40 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
     Returns:
         - None
     """
-    with db_lock:
-        if recipient not in redis_message_queue:
-            return
-        
-        for msg in redis_message_queue[recipient]:
-            send_framed_msg(client_socket, msg, 'D')
-        del redis_message_queue[recipient]
+
+    key = f"offline:{recipient}"
+
+    while True:
+        msg = redis_client.lpop(key)
+        if not msg:
+            break
+
+        send_framed_msg(client_socket, msg, 'D')
+
+# ------------------------
+# GOOGLE CLOUD STORAGE
+# ------------------------
+
+def upload_to_gcs(filename: str, data_b64: str):
+    data = base64.b64decode(data_b64)
+
+    blob = bucket.blob(filename)
+    blob.upload_from_string(data)
+
+    return blob.public_url
+
+def download_from_gcs(filename: str):
+    blob = bucket.blob(filename)
+
+    if not blob.exists():
+        return None
+    
+    data = blob.download_as_bytes()
+    return base64.b64encode(data).decode()
+
+# ---------------------
+# CLIENT HANDLING
+# ---------------------
 
 def handle_client(client_socket: socket.socket, addr) -> None:
     """
@@ -121,12 +171,17 @@ def handle_client(client_socket: socket.socket, addr) -> None:
                             
     except Exception as e:
         print(f"[ERROR] with {addr}: {e}")
+
     finally:
         client_socket.close()
-        with db_lock:
-            if username and ChatServer.get_peer_info(username): 
-                ChatServer.remove_client(username)
-                print(f"[DISCONNECTED] {username}")
+
+        if username and ChatServer.get_peer_info(username): 
+            ChatServer.remove_client(username)
+            print(f"[DISCONNECTED] {username}")
+
+# ----------------
+# MAIN CHAT LOOP
+# ----------------
 
 def main_chat_loop(client_socket: socket.socket, username: str) -> None:
     """
@@ -152,26 +207,39 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         recipient = parts[1]
         data = parts[2] if len(parts) > 2 else ""
 
-        # FEATURE: Server logs routing info, but remains BLIND to the message payload data
-        print(f"[ROUTING] {command} from '{username}' to '{recipient}'")
-
+        # ---- DIRECT MESSAGE ------
         if command == "SEND":
             # FEATURE: Prevent sending messages to non-existent users
-            if recipient not in postgresql_users:
+            if not user_exists(recipient):
                 send_framed_msg(client_socket, f"ERROR: User '{recipient}' does not exist in the system.", 'C')
                 continue
 
-            target_online = ChatServer.get_peer_info(recipient) is not None
+            target_online = ChatServer.get_peer_info(recipient)
+
             ChatServer.send_dm(username, recipient, data, send_framed_msg, queue_offline_message)
             
             # FEATURE: Delivery Notification OR Last Seen feedback
             if target_online:
-                send_framed_msg(client_socket, f"[SYSTEM] Message delivered to '{recipient}'.", 'C')
+                send_framed_msg(client_socket, f"DELIVERED", 'C')
             else:
                 last_seen_time = ChatServer.get_last_seen(recipient)
-                sys_msg = f"[SYSTEM] Message sent. User '{recipient}' is currently offline. Last seen at {last_seen_time}."
-                send_framed_msg(client_socket, sys_msg, 'C')
+                send_framed_msg(client_socket, f"USER OFFLINE. LAST SEEN AT {last_seen_time}", 'C')
 
+        # ----- MEDIA UPLOAD --------
+        elif command == "UPLOAD_MEDIA":
+            filename, filedata = data.split("|", 1)
+            url = upload_to_gcs(filename, filedata)
+            send_framed_msg(client_socket, f"MEDIA_URL:{url}", 'C')
+
+        # ----- MEDIA DOWNLOAD -------
+        elif command == "DOWNLOAD_MEDIA":
+            filedata = download_from_gcs(data)
+
+            if not filedata:
+                send_framed_msg(client_socket, "ERROR: FILE NOT FOUND", 'C')
+            else:
+                send_framed_msg(client_socket, f"FILE:{filedata}", 'D')
+        
         elif command == "SEND_GROUP":
             status = ChatServer.send_group_message(username, recipient, data, send_framed_msg, queue_offline_message)
             if status != "SUCCESS":
@@ -232,7 +300,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                         send_framed_msg(client_socket, f"ERROR: No other members online in group {recipient}. File not sent.", 'C')
                 else:
                     # Feature: Prevent sending files to non-existent users
-                    if recipient not in postgresql_users:
+                    if not user_exists(recipient):
                         send_framed_msg(client_socket, f"ERROR: User '{recipient}' does not exist in the system.", 'C')
                     else:
                         last_seen_time = ChatServer.get_last_seen(recipient)
@@ -256,14 +324,14 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
         
         if msg.startswith("CHECK:"):
             check_user = msg.split(":")[1]
-            if check_user in postgresql_users:
+            if not user_exists(check_user):
                 send_framed_msg(client_socket, "EXISTS", 'A')
             else:
                 send_framed_msg(client_socket, "NOT_FOUND", 'A')
                 
         elif msg.startswith("LOGIN:"):
             _, login_user, login_pwd = msg.split(":", 2)
-            if postgresql_users.get(login_user) != login_pwd:
+            if not auth_user(login_user, login_pwd):
                 send_framed_msg(client_socket, "FAIL", 'A')
                 continue
 
@@ -281,11 +349,11 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
             _, reg_user, reg_pwd = msg.split(":", 2)
 
             with db_lock:
-                if reg_user in postgresql_users:
+                if user_exists(reg_user):
                     send_framed_msg(client_socket, "USER_EXISTS", 'A')
                     continue
 
-                postgresql_users[reg_user] = reg_pwd
+                register_user(reg_user, reg_pwd)
 
             username = reg_user
             send_framed_msg(client_socket, "SUCCESS", 'A')
