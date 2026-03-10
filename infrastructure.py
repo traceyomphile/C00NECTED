@@ -49,7 +49,7 @@ def initialise_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            last_seen INTEGER
+            last_seen DATETIME
         )
         """)
 

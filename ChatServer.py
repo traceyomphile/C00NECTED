@@ -20,7 +20,7 @@ Date: 2024-06-01
 from threading import Lock
 import socket
 from datetime import datetime
-from infrastructure import pg_pool, redis_client
+from infrastructure import redis_client, db_lock, get_db
 
 PRESENCE_TTL = 120
 
@@ -30,7 +30,7 @@ clients_lock: Lock = Lock()
 
 def get_timestamp() -> str:
     """Generates a formatted timestamp for messages."""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%s")
 
 # ----------------------------
 # PRESENCE MANAGEMENT (REDIS)
@@ -85,6 +85,7 @@ def remove_client(username: str):
     with clients_lock:
         if username in clients:
             del clients[username]
+        update_last_seen(username)
         set_user_offline(username)
 
 # ----------------------------------------
@@ -99,13 +100,17 @@ def is_group(group_id: str) -> bool:
     Returns:
         - True if the group exists, False otherwise.
     """
-    with pg_pool.getconn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM groups WHERE group_id=%s",
-                (group_id,)
-            )
-            return cur.fetchone() is not None
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            "SELECT 1 FROM groups WHERE group_id=?",
+            (group_id,)
+        )
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
 
 def get_group_presence(group_id: str, exclude_user: str) -> tuple[list, list]:
     """
@@ -119,13 +124,16 @@ def get_group_presence(group_id: str, exclude_user: str) -> tuple[list, list]:
     online_peers = []
     offline_members = []
 
-    with pg_pool.getconn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT username FROM group_members WHERE group_id=%s",
-                (group_id,)
-            )
-            members = [row[0] for row in cur.fetchall()]
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT username FROM group_members WHERE group_id=?",
+            (group_id,)
+        )
+        members = [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
 
     for member in members:
         if member == exclude_user:
@@ -175,28 +183,33 @@ def create_group(group_id: str, creator: str) -> bool:
     Returns:
         - True if the group was created successfully, False if a group with the same ID already exists.
     """
-    with pg_pool.getconn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM groups WHERE group_id=%s",
-                (group_id,)
-            )
+    conn = get_db()
+    cur = conn.cursor()
 
-            if cur.fetchone():
-                return False
-            
+    try:
+        cur.execute(
+            "SELECT 1 FROM groups WHERE group_id=?",
+            (group_id,)
+        )
+
+        if cur.fetchone():
+            return False
+        
+        with db_lock:
             cur.execute(
-                "INSERT INTO groups(group_id) VALUES(%s)",
+                "INSERT INTO groups(group_id) VALUES(?)",
                 (group_id)
             )
 
             cur.execute(
-                "INSERT INTO group_members(group_id, username) VALUES(%s,%s)",
+                "INSERT INTO group_members(group_id, username) VALUES(?,?)",
                 (group_id, creator)
             )
 
             conn.commit()
-    return True
+            return True
+    finally:
+        conn.close()
     
 def add_to_group(group_id: str, adder_username: str, target_username: str) -> str:
     """
@@ -208,40 +221,45 @@ def add_to_group(group_id: str, adder_username: str, target_username: str) -> st
     Returns:
         - A string status code indicating the result ("GROUP_NOT_FOUND", "NOT_MEMBER", "ALREADY_MEMBER", or "SUCCESS").
     """
-    with pg_pool.getconn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM groups WHERE group_id=%s",
-                (group_id)
-            )
+    conn = get_db()
+    cur = conn.cursor()
 
-            if not cur.fetchone():
-                return "GROUP_NOT_FOUND"
-            
-            cur.execute(
-                "SELECT 1 FROM group_members WHERE group_id=%s AND username=%s",
-                (group_id, adder_username)
-            )
+    try:
+        cur.execute(
+            "SELECT 1 FROM groups WHERE group_id=?",
+            (group_id)
+        )
 
-            if not cur.fetchone():
-                return "NOT MEMBER"
-            
-            cur.execute(
-                "SELECT 1 FROM group_members WHERE group_id=%s AND username=%s",
-                (group_id, target_username)
-            )
+        if not cur.fetchone():
+            return "GROUP_NOT_FOUND"
+        
+        cur.execute(
+            "SELECT 1 FROM group_members WHERE group_id=? AND username=?",
+            (group_id, adder_username)
+        )
 
-            if cur.fetchone():
-                return "ALREADY_MEMBER"
-            
+        if not cur.fetchone():
+            return "NOT MEMBER"
+        
+        cur.execute(
+            "SELECT 1 FROM group_members WHERE group_id=? AND username=?",
+            (group_id, target_username)
+        )
+
+        if cur.fetchone():
+            return "ALREADY_MEMBER"
+        
+        with db_lock:
             cur.execute(
-                "INSERT INTO group_members(group_id, username) VALUES(%s,%s)",
+                "INSERT INTO group_members(group_id, username) VALUES(?,?)",
                 (group_id, target_username)
             )
 
             conn.commit()
 
-    return "SUCCESS"
+            return "SUCCESS"
+    finally:
+        conn.close()
     
 def leave_group(group_id: str, username: str) -> bool:
     """
@@ -252,15 +270,18 @@ def leave_group(group_id: str, username: str) -> bool:
     Returns:
         - True if the user was removed from the group successfully, False if the user is not in the group.
     """
-    with pg_pool.getconn() as conn:
-        with conn.cursor() as cur:
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        with db_lock:
             cur.execute(
-                "DELETE FROM group_members WHERE group_id=%s AND username=%s",
+                "DELETE FROM group_members WHERE group_id=? AND username=?",
                 (group_id, username)
             )
 
             cur.execute(
-                "SELECT COUNT(*) FROM group_members WHERE group_id=%s",
+                "SELECT COUNT(*) FROM group_members WHERE group_id=?",
                 (group_id,)
             )
 
@@ -268,13 +289,15 @@ def leave_group(group_id: str, username: str) -> bool:
 
             if count == 0:
                 cur.execute(
-                    "DELETE FROM groups WHERE group_id=%s",
+                    "DELETE FROM groups WHERE group_id=?",
                     (group_id,)
                 )
 
             conn.commit()
 
-    return True
+        return True
+    finally:
+        conn.close()
     
 def send_group_message(sender: str, group_id: str, message: str, send_func: callable, queue_func: callable) -> str:
     """
@@ -288,29 +311,34 @@ def send_group_message(sender: str, group_id: str, message: str, send_func: call
     Returns:
         - A string status indicating success ("SUCCESS") or failure ("GROUP_NOT_FOUND", "NOT_MEMBER").
     """
-    with pg_pool.getconn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT username FROM group_members WHERE group_id=%s",
-                (group_id,)
-            )
+    conn = get_db()
+    cur = conn.cursor()
+    members = None
 
-            members = [row[0] for row in cur.fetchall()]
+    try:
+        cur.execute(
+            "SELECT username FROM group_members WHERE group_id=?",
+            (group_id,)
+        )
 
-        timestamped = f"[{get_timestamp()}] [{group_id}] {sender}: {message}"
+        members = [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
 
-        for member in members:
-            if member == sender:
-                continue
+    timestamped = f"[{get_timestamp()}] [{group_id}] {sender}: {message}"
 
-            if member in clients:
-                try:
-                    sock = clients[member][0]
-                    send_func(sock, timestamped, 'D')
-                except:
-                    queue_func(member, timestamped)
-            else:
+    for member in members:
+        if member == sender:
+            continue
+
+        if member in clients:
+            try:
+                sock = clients[member][0]
+                send_func(sock, timestamped, 'D')
+            except:
                 queue_func(member, timestamped)
+        else:
+            queue_func(member, timestamped)
 
     return "SUCCESS"
 
@@ -325,13 +353,18 @@ def get_group_peers(group_id: str, exclude_user: str) -> list:
     """
     peer_list = []
     
-    with pg_pool.getconn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT username FROM group_members WHERE group_id=%s",
-                (group_id,)
-            )
-            members = [row[0] for row in cur.fetchall]
+    conn = get_db()
+    cur = conn.cursor()
+    members = None  
+
+    try:
+        cur.execute(
+            "SELECT username FROM group_members WHERE group_id=?",
+            (group_id,)
+        )
+        members = [row[0] for row in cur.fetchall]
+    finally:
+        conn.close()
 
     with clients_lock:
         for member in members:
@@ -341,7 +374,58 @@ def get_group_peers(group_id: str, exclude_user: str) -> list:
     
     return peer_list
 
+def update_last_seen(username: str):
+    with db_lock:
+        conn = get_db()
+        cur = conn.cursor()
 
+        try:
+            cur.execute(
+                "UPDATE users SET last_seen=? WHERE username=?",
+                (datetime.now(), username)
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
+def get_last_seen(username: str):
+    # Check Redis Presence
+    if redis_client.get(f"presence{username}"):
+        return "online"
+    
+    conn = get_db()
+    cur = conn.cursor()
 
+    try:
+        cur.execute(
+            "SELECT last_seen FROM users WHERE username=?",
+            (username,) 
+        )
 
+        row = cur.fetchone()
+
+        if not row or not row["last_seen"]:
+            return "Never"
+        
+        last_seen = datetime.fromisoformat(row["last_seen"])
+
+        delta = datetime.now() - last_seen
+
+        return delta
+    
+    finally:
+        conn.close()
+
+def format_last_seen(delta: datetime):
+    seconds = int(delta.total_seconds)
+
+    if seconds < 60:
+        return "last seen just now"
+    
+    if seconds < 3600:
+        return f"last seen {seconds // 60} minutes ago"
+    
+    if seconds < 86400:
+        return f"last seen {seconds // 3600} hours ago"
+    
+    return f"last seen {seconds // 86400} days ago"

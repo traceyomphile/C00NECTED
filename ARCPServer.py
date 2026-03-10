@@ -24,7 +24,8 @@ import socket
 import threading
 import ChatServer
 import base64
-from infrastructure import pg_conn, redis_client, bucket
+from infrastructure import redis_client, bucket, db_lock, get_db, initialise_database
+
 
 # Server Configuration
 HOST = socket.gethostbyname(socket.gethostname())
@@ -82,21 +83,38 @@ def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, Non
 # ----------------------
 
 def user_exists(username: str) -> bool:
-    with PG_SQL_CON.cursor() as cur:
+    # Get connection
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
         cur.execute("SELECT 1 FROM users WHERE username=%s", (username,))
         return cur.fetchone() is not None
+    finally:
+        conn.close()
     
 def auth_user(username: str, password: str) -> bool:
-    with PG_SQL_CON.cursor as cur:
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
         cur.execute("SELECT password FROM users WHERE username=%s", (username,))
 
         row = cur.fetchone()
         return row and row[0] == password
+    finally:
+        conn.close()
     
 def register_user(username: str, password: str):
-    with PG_SQL_CON.cursor() as cur:
-        cur.execute("INSERT INTO users(username, password) VALUES(%s, %s)", (username, password))
-        PG_SQL_CON.commit()
+    with db_lock:
+        conn = get_db()
+        cur = conn.cursor()
+
+        try:
+            cur.execute("INSERT INTO users(username, password) VALUES(%s, %s)", (username, password))
+            conn.commit()
+        finally:
+            conn.close()
 
 # --------------------
 # REDIS OFFLINE QUEUE
@@ -175,8 +193,8 @@ def handle_client(client_socket: socket.socket, addr) -> None:
     finally:
         client_socket.close()
 
-        if username and ChatServer.get_peer_info(username): 
-            ChatServer.remove_client(username)
+        if username and ChatServer.get_user_presence(username) is not None: 
+            ChatServer.set_user_offline(username)
             print(f"[DISCONNECTED] {username}")
 
 # ----------------
@@ -214,7 +232,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 send_framed_msg(client_socket, f"ERROR: User '{recipient}' does not exist in the system.", 'C')
                 continue
 
-            target_online = ChatServer.get_peer_info(recipient)
+            target_online = ChatServer.get_user_presence(recipient)
 
             ChatServer.send_dm(username, recipient, data, send_framed_msg, queue_offline_message)
             
@@ -223,7 +241,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 send_framed_msg(client_socket, f"DELIVERED", 'C')
             else:
                 last_seen_time = ChatServer.get_last_seen(recipient)
-                send_framed_msg(client_socket, f"USER OFFLINE. LAST SEEN AT {last_seen_time}", 'C')
+                send_framed_msg(client_socket, f"USER OFFLINE. {ChatServer.format_last_seen(last_seen_time)}", 'C')
 
         # ----- MEDIA UPLOAD --------
         elif command == "UPLOAD_MEDIA":
@@ -342,6 +360,7 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
 
             username = login_user
             send_framed_msg(client_socket, "SUCCESS", 'A')
+            ChatServer.set_user_online(username, addr[0], udp_port)
             break # Exit auth loop!
                 
                 
@@ -357,6 +376,7 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
 
             username = reg_user
             send_framed_msg(client_socket, "SUCCESS", 'A')
+            ChatServer.set_user_online(username, addr[0], udp_port)
             break # Exit auth loop!
 
     # Receive the dynamically assigned UDP port after login
@@ -381,6 +401,8 @@ def start_server() -> None:
     server.bind((HOST, PORT))
     server.listen()
     print(f"Server listening on {HOST}:{PORT}...")
+    initialise_database()
+    
     while True:
         conn, addr = server.accept()
         threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()

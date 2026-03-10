@@ -39,7 +39,7 @@ def receive_udp_media(udp_sock: socket.socket) -> None:
         expected_bytes = None
         
         while True:
-            data, addr = udp_sock.recvfrom(4100)
+            data, addr = udp_sock.recvfrom(65535)   # UDP packets can go up to ~65KB
 
             if data.startswith(b"FILENAME:"):
                 output_filename = data.decode().split(':', 1)[1]
@@ -94,6 +94,7 @@ def send_image_udp(filepath, target_ip, target_udp_port) -> None:
     try:
         # Open the file in 'rb' (read binary) mode
         filename = os.path.basename(filepath)
+        file_ext = os.path.splitext(filename)[1]    # Extract file extension
 
         with open(filepath, 'rb') as file:
             file_size = os.path.getsize(filepath)
@@ -124,7 +125,10 @@ def send_image_udp(filepath, target_ip, target_udp_port) -> None:
                 
                 # A tiny sleep prevents overwhelming the local buffer during testing
                 time.sleep(0.001) 
-                
+            
+            # End Of File marker
+            udp_sock.sendto(b"EOF", (target_ip, target_udp_port))
+            
         print(f"[UDP] Successfully transmitted {bytes_sent} bytes to {target_ip}.")
         
     except FileNotFoundError:
