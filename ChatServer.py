@@ -20,15 +20,52 @@ Date: 2024-06-01
 from threading import Lock
 import socket
 from datetime import datetime
+from infrastructure import redis_client, db_lock, get_db
 
+PRESENCE_TTL = 120
+
+# Thread-safe registry for ACTIVE socket connections only
 clients = {}
-last_seen = {} # Tracks when users disconnect: username -> timestamp
-groups = {} # group_id -> set of usernames
 clients_lock: Lock = Lock()
 
 def get_timestamp() -> str:
     """Generates a formatted timestamp for messages."""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%s")
+
+# ----------------------------
+# PRESENCE MANAGEMENT (REDIS)
+# ----------------------------
+
+def set_user_online(username: str, ip: str, port: int):
+    key = f"presence:{username}"
+    value = f"{ip}:{port}"
+
+    redis_client.set(key, value, ex=PRESENCE_TTL)
+
+def refresh_presence(username: str):
+    key = f"presence:{username}"
+
+    if redis_client.exists(key):
+        redis_client.expire(key, PRESENCE_TTL)
+
+def set_user_offline(username: str):
+    redis_client.delete(f"presence:{username}")
+
+def get_user_presence(username: str):
+    value = redis_client.get(f"presence:{username}")
+
+    if not value:
+        return None
+    
+    if isinstance(value, bytes):
+        value = value.decode('utf-8')
+    
+    ip, port = value.split(":")
+    return ip, int(port)
+
+# --------------------------------------
+# CLIENT REGISTRATION (MEMORY)
+# --------------------------------------
 
 def register_client(username: str, client_socket: socket.socket, ip: str, udp_port: int) -> None:
     """
@@ -44,41 +81,16 @@ def register_client(username: str, client_socket: socket.socket, ip: str, udp_po
     with clients_lock:
         clients[username] = (client_socket, ip, udp_port)
 
-def remove_client(username: str) -> None:
-    """
-    Removes a client from the global clients dictionary upon disconnection.
-    Parameters:
-        - username: The unique identifier for the client to be removed.
-    Returns:
-        - None
-    """
+def remove_client(username: str):
     with clients_lock:
         if username in clients:
-            # Record last seen time before deleting
-            last_seen[username] = get_timestamp()
             del clients[username]
+        update_last_seen(username)
+        set_user_offline(username)
 
-def get_last_seen(username: str) -> str:
-    """
-    Fetches the last seen timestamp of a user.
-    Parameters:
-        - username: The unique identifier for the client.
-    Returns:
-        - A string containing the timestamp or a default status message.
-    """
-    with clients_lock:
-        return last_seen.get(username, "Never logged in or currently online")
-
-def get_peer_info(username: str) -> tuple:
-    """
-    Retrieves the connection information for a given username.
-    Parameters:
-        - username: The unique identifier for the client whose information is being requested.
-    Returns:    
-        - A tuple containing (socket, ip, udp_port) if the user is online, or None if offline.
-    """
-    with clients_lock:
-        return clients.get(username)
+# ----------------------------------------
+# GROUP & MESSAGING LOGIC (POSTGRES)
+# ----------------------------------------
 
 def is_group(group_id: str) -> bool:
     """
@@ -88,26 +100,17 @@ def is_group(group_id: str) -> bool:
     Returns:
         - True if the group exists, False otherwise.
     """
-    with clients_lock:
-        return group_id in groups
+    conn = get_db()
+    cur = conn.cursor()
 
-def get_group_peers(group_id: str, exclude_user: str) -> list:
-    """
-    Gets the IP and UDP port of all ONLINE members of a group for P2P multicast file transfers.
-    Parameters:
-        - group_id: The group to fetch peers for.
-        - exclude_user: The username of the sender to exclude from the return list.
-    Returns:
-        - A list of tuples containing (ip, port) for each online member.
-    """
-    peer_list = []
-    with clients_lock:
-        if group_id in groups:
-            for member in groups[group_id]:
-                if member != exclude_user and member in clients:
-                    _, ip, port = clients[member]
-                    peer_list.append((ip, port))
-    return peer_list
+    try:
+        cur.execute(
+            "SELECT 1 FROM groups WHERE group_id=?",
+            (group_id,)
+        )
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
 
 def get_group_presence(group_id: str, exclude_user: str) -> tuple[list, list]:
     """
@@ -120,15 +123,29 @@ def get_group_presence(group_id: str, exclude_user: str) -> tuple[list, list]:
     """
     online_peers = []
     offline_members = []
-    with clients_lock:
-        if group_id in groups:
-            for member in groups[group_id]:
-                if member != exclude_user:
-                    if member in clients:
-                        _, ip, port = clients[member]
-                        online_peers.append((ip, port))
-                    else:
-                        offline_members.append(member)
+
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT username FROM group_members WHERE group_id=?",
+            (group_id,)
+        )
+        members = [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+    for member in members:
+        if member == exclude_user:
+            continue
+
+        with clients_lock:
+            if member in clients:
+                _, ip, port = clients[member]
+                online_peers.append((ip, port))
+            else:
+                offline_members.append(member)
+
     return online_peers, offline_members
 
 def send_dm(sender: str, target: str, content: str, send_func: callable, queue_func: callable) -> bool:
@@ -149,11 +166,12 @@ def send_dm(sender: str, target: str, content: str, send_func: callable, queue_f
             try:
                 sock = clients[target][0]
                 send_func(sock, timestamped_msg, 'D')
+                return True
             except Exception:
-                # If the socket is dead but hasn't been cleaned up yet, queue it.
-                queue_func(target, timestamped_msg)
-        else:
-            queue_func(target, timestamped_msg)
+                # Socket failed, fall through to queuing
+                pass
+    
+    queue_func(target, timestamped_msg)
     return True
 
 def create_group(group_id: str, creator: str) -> bool:
@@ -165,11 +183,33 @@ def create_group(group_id: str, creator: str) -> bool:
     Returns:
         - True if the group was created successfully, False if a group with the same ID already exists.
     """
-    with clients_lock:
-        if group_id in groups:
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            "SELECT 1 FROM groups WHERE group_id=?",
+            (group_id,)
+        )
+
+        if cur.fetchone():
             return False
-        groups[group_id] = {creator}
-        return True
+        
+        with db_lock:
+            cur.execute(
+                "INSERT INTO groups(group_id) VALUES(?)",
+                (group_id)
+            )
+
+            cur.execute(
+                "INSERT INTO group_members(group_id, username) VALUES(?,?)",
+                (group_id, creator)
+            )
+
+            conn.commit()
+            return True
+    finally:
+        conn.close()
     
 def add_to_group(group_id: str, adder_username: str, target_username: str) -> str:
     """
@@ -181,16 +221,45 @@ def add_to_group(group_id: str, adder_username: str, target_username: str) -> st
     Returns:
         - A string status code indicating the result ("GROUP_NOT_FOUND", "NOT_MEMBER", "ALREADY_MEMBER", or "SUCCESS").
     """
-    with clients_lock:
-        if group_id not in groups:
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            "SELECT 1 FROM groups WHERE group_id=?",
+            (group_id)
+        )
+
+        if not cur.fetchone():
             return "GROUP_NOT_FOUND"
-        if adder_username not in groups[group_id]:
-            return "NOT_MEMBER"
-        if target_username in groups[group_id]:
+        
+        cur.execute(
+            "SELECT 1 FROM group_members WHERE group_id=? AND username=?",
+            (group_id, adder_username)
+        )
+
+        if not cur.fetchone():
+            return "NOT MEMBER"
+        
+        cur.execute(
+            "SELECT 1 FROM group_members WHERE group_id=? AND username=?",
+            (group_id, target_username)
+        )
+
+        if cur.fetchone():
             return "ALREADY_MEMBER"
         
-        groups[group_id].add(target_username)
-        return "SUCCESS"
+        with db_lock:
+            cur.execute(
+                "INSERT INTO group_members(group_id, username) VALUES(?,?)",
+                (group_id, target_username)
+            )
+
+            conn.commit()
+
+            return "SUCCESS"
+    finally:
+        conn.close()
     
 def leave_group(group_id: str, username: str) -> bool:
     """
@@ -201,14 +270,34 @@ def leave_group(group_id: str, username: str) -> bool:
     Returns:
         - True if the user was removed from the group successfully, False if the user is not in the group.
     """
-    with clients_lock:
-        if group_id in groups and username in groups[group_id]:
-            groups[group_id].remove(username)
-            # Cleanup if the group is now empty
-            if not groups[group_id]:
-                del groups[group_id]
-            return True
-        return False
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        with db_lock:
+            cur.execute(
+                "DELETE FROM group_members WHERE group_id=? AND username=?",
+                (group_id, username)
+            )
+
+            cur.execute(
+                "SELECT COUNT(*) FROM group_members WHERE group_id=?",
+                (group_id,)
+            )
+
+            count = cur.fetchone()[0]
+
+            if count == 0:
+                cur.execute(
+                    "DELETE FROM groups WHERE group_id=?",
+                    (group_id,)
+                )
+
+            conn.commit()
+
+        return True
+    finally:
+        conn.close()
     
 def send_group_message(sender: str, group_id: str, message: str, send_func: callable, queue_func: callable) -> str:
     """
@@ -222,25 +311,121 @@ def send_group_message(sender: str, group_id: str, message: str, send_func: call
     Returns:
         - A string status indicating success ("SUCCESS") or failure ("GROUP_NOT_FOUND", "NOT_MEMBER").
     """
+    conn = get_db()
+    cur = conn.cursor()
+    members = None
+
+    try:
+        cur.execute(
+            "SELECT username FROM group_members WHERE group_id=?",
+            (group_id,)
+        )
+
+        members = [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+    timestamped = f"[{get_timestamp()}] [{group_id}] {sender}: {message}"
+
+    for member in members:
+        if member == sender:
+            continue
+
+        if member in clients:
+            try:
+                sock = clients[member][0]
+                send_func(sock, timestamped, 'D')
+            except:
+                queue_func(member, timestamped)
+        else:
+            queue_func(member, timestamped)
+
+    return "SUCCESS"
+
+def get_group_peers(group_id: str, exclude_user: str) -> list:
+    """
+    Gets the IP and UDP port of all ONLINE members of a group for P2P multicast file transfers.
+    Parameters:
+        - group_id: The group to fetch peers for.
+        - exclude_user: The username of the sender to exclude from the return list.
+    Returns:
+        - A list of tuples containing (ip, port) for each online member.
+    """
+    peer_list = []
+    
+    conn = get_db()
+    cur = conn.cursor()
+    members = None  
+
+    try:
+        cur.execute(
+            "SELECT username FROM group_members WHERE group_id=?",
+            (group_id,)
+        )
+        members = [row[0] for row in cur.fetchall]
+    finally:
+        conn.close()
+
     with clients_lock:
-        if group_id not in groups:
-            return "GROUP_NOT_FOUND"
+        for member in members:
+            if member != exclude_user and member in clients:
+                _, ip, port, = clients[member]
+                peer_list.append((ip, port))
+    
+    return peer_list
+
+def update_last_seen(username: str):
+    with db_lock:
+        conn = get_db()
+        cur = conn.cursor()
+
+        try:
+            cur.execute(
+                "UPDATE users SET last_seen=? WHERE username=?",
+                (datetime.now(), username)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+def get_last_seen(username: str):
+    # Check Redis Presence
+    if redis_client.get(f"presence{username}"):
+        return "online"
+    
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            "SELECT last_seen FROM users WHERE username=?",
+            (username,) 
+        )
+
+        row = cur.fetchone()
+
+        if not row or not row["last_seen"]:
+            return "Never"
         
-        if sender not in groups[group_id]:
-            return "NOT_MEMBER"
-            
-        timestamped_msg = f"[{get_timestamp()}] [{group_id}] {sender}: {message}"
-        
-        for member in groups[group_id]:
-            if member != sender:
-                if member in clients:
-                    try:
-                        sock = clients[member][0]
-                        send_func(sock, timestamped_msg, 'D')
-                    except Exception:
-                        # Ensures one broken client doesn't break the loop for others
-                        queue_func(member, timestamped_msg)
-                else:
-                    queue_func(member, timestamped_msg)
-                    
-        return "SUCCESS"
+        last_seen = datetime.fromisoformat(row["last_seen"])
+
+        delta = datetime.now() - last_seen
+
+        return delta
+    
+    finally:
+        conn.close()
+
+def format_last_seen(delta: datetime):
+    seconds = int(delta.total_seconds)
+
+    if seconds < 60:
+        return "last seen just now"
+    
+    if seconds < 3600:
+        return f"last seen {seconds // 60} minutes ago"
+    
+    if seconds < 86400:
+        return f"last seen {seconds // 3600} hours ago"
+    
+    return f"last seen {seconds // 86400} days ago"
