@@ -649,13 +649,26 @@ def receive_tcp_messages(sock: socket.socket, my_udp_socket: socket.socket) -> N
             if msg_type == 'C' and msg.startswith("CALL_PEER_INFO:"):
                 _, peer_user, peer_ip, peer_udp_port = msg.split(":")
 
-                print(f"\n[CALL] Connecting to {peer_user} at {peer_ip}:{peer_udp_port} (UDP)")
+                print(f"\n[CALL] Ringing {peer_user}")
 
                 threading.Thread(
                     target=start_call_udp,
-                    args=(peer_ip, int(peer_udp_port)),
+                    args=(peer_ip, int(peer_udp_port), my_udp_socket),
                     daemon=True
                 ).start()
+                continue
+
+            # ----- Call Signalling: callee accepted our call ---------
+            if msg_type == 'C' and msg.startswith("CALL_ACCEPTED:"):
+                callee = msg.split(":")[1]
+                print(f"\n[CALL] {callee} accepted your call! Waiting for connection...")
+                continue
+
+            # ----- Call Signalling: callee rejected our call ---------
+            if msg_type == 'C' and msg.startswith("CALL_REJECTED:"):
+                callee = msg.split(":")[1]
+                print(f"\n[CALL] {callee} rejected your call.")
+                continue
 
             # ------------ All Other Server Messages ----------
             print(f"\n{msg}")
@@ -714,7 +727,15 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
                         
                         if reg_resp == "SUCCESS":
                             print("\n[SYSTEM] Registration successful! Welcome to the Chat.")
-                            return new_user
+                            return 
+                        
+                        elif reg_resp.startswith("WEAK_PASSWORD:"):
+                            reason = reg_resp.split(":", 1)[1]
+                            print(f"[ERROR] {reason}")
+                            print(f"[INFO] Requirements: 8+ chars, uppercase, lowercase, digit, special character (e.g. !@#$..)")
+                        else:
+                            print(f"[ERROR] Registration failed: {reg_resp}")
+                            break
             else:
                 return None # Exits program if they decline registration
 
@@ -835,7 +856,7 @@ def start_client() -> None:
             filepath = data
             file_type = get_file_type(filepath)
 
-            if filepath == 'unknown':
+            if file_type == 'unknown':
                 print(
                     f"[ERROR] Unsupported file type. Supported:\n"
                     f" Images : {', '.join(sorted(IMAGE_EXTS))}\n"
