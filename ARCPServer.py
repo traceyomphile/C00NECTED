@@ -340,6 +340,12 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 send_framed_msg(client_socket, f"ERROR: User '{recipient}' does not exist in the system.", 'C')
                 continue
 
+            if recipient == username:
+                timestamped_msg = f"[{ChatServer.get_timestamp()}] [You]: {data}"
+                send_framed_msg(client_socket, timestamped_msg, 'D')
+                send_framed_msg(client_socket, 'DELIVERED', 'C')
+                continue
+
             target_online = ChatServer.get_user_presence(recipient)
 
             ChatServer.send_dm(username, recipient, data, send_framed_msg, queue_offline_message)
