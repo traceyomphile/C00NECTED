@@ -22,6 +22,7 @@ Date: 2026-03-11
 
 import socket
 import threading
+import re
 import ChatServer
 from infrastructure import redis_client, db_lock, get_db, initialise_database
 
@@ -67,6 +68,57 @@ def register_user(username: str, password: str):
             conn.commit()
         finally:
             conn.close()
+
+# -----------------------
+# PASSWORD VALIDATION
+# -----------------------
+
+# Common weak passwords to explicitly block
+_WEAK_PASSWORDS = {
+    "password", "123456", "123456789", "qwerty", "abc123", "letmein", "monkey", "dragon",
+    "111111", "baseball", "iloveyou", "trustno1", "1234567", "sunshine", "master",
+    "123123", "welcome", "shadow", "ashley", "football", "jesus", "michael",
+    "ninja", "mustang", "password1", "passw0rd", "password123"
+}
+
+def validate_password(password: str) -> tuple[bool, str]:
+    """
+    Enforces strong password requirements.
+    
+    Rules:
+        - At least 8 characters long
+        - At least one uppercase letter (A-Z)
+        - At least one lowercase letter (a-z)
+        - At least one digit (0-9)
+        - At least one special character (!@#$%^&*...)
+        - Not a commonly used weak password
+
+    Parameters:
+        - password: The password string to validate.
+
+    Returns:
+        - (True, "") if the password is strong.
+        - (False, reason) describing the first failed rule.
+    """
+    if password.lower() in _WEAK_PASSWORDS:
+        return False, "Password is too common. Choose a more unique password."
+
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters long."
+
+    if not re.search(r'[A-Z]', password):
+        return False, "Password must contain at least one uppercase letter."
+
+    if not re.search(r'[a-z]', password):
+        return False, "Password must contain at least one lowercase letter."
+    
+    if not re.search(r'\d', password):
+        return False, "Password must contain at least one digit."
+
+    if not re.search(r'[!@#$%^&*()_+|-=\[\]{};\'\\:"|,.<>/?`~]', password):
+        return False, "Password must contain at least one special character."
+    
+    return True, ""
 
 # --------------------
 # REDIS OFFLINE QUEUE
@@ -247,11 +299,20 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
                 send_framed_msg(client_socket, "USER_EXISTS", 'A')
                 continue
 
+            ok, reason = validate_password(reg_pwd)
+            if not ok:
+                send_framed_msg(client_socket, f"WEAK_PASSWORD: {reason}", 'A')
+                continue
+
             register_user(reg_user, reg_pwd)
+            print(f"[REGISTERED USER] {reg_user}")
 
             username = reg_user
             send_framed_msg(client_socket, "SUCCESS", 'A')
             break
+
+    # Force-clear any stale presence key from a previous session.
+    ChatServer.set_user_offline(username)
 
     # Client sends PORT: (TCP media port) then CALL_PORT: (UDP call port) after auth
     _, port_msg = receive_framed_msg(client_socket)
@@ -344,11 +405,14 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 timestamped_msg = f"[{ChatServer.get_timestamp()}] [You]: {data}"
                 send_framed_msg(client_socket, timestamped_msg, 'D')
                 send_framed_msg(client_socket, 'DELIVERED', 'C')
+                print(f"[TEXT MESSAGE] {username} -> {username} (self)")
                 continue
 
             target_online = ChatServer.get_user_presence(recipient)
 
             ChatServer.send_dm(username, recipient, data, send_framed_msg, queue_offline_message)
+            status = "DELIVERED" if target_online else "QUEUED (offline)"
+            print(f"[TEXT MESSAGE] {username} -> {recipient} | {status}")
             
             # FEATURE: Delivery Notification OR Last Seen feedback
             if target_online:
@@ -358,6 +422,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 send_framed_msg(client_socket, f"USER OFFLINE. {last_seen_time}", 'C')
         
         elif command == "SEND_GROUP":
+            print(f"[GROUP MESSAGE] {username} -> group '{recipient}'")
             status = ChatServer.send_group_message(username, recipient, data, send_framed_msg, queue_offline_message)
             if status != "SUCCESS":
                 send_framed_msg(client_socket, f"ERROR: {status}", 'C')
@@ -377,8 +442,10 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 # Determine whether the target is a group or a user
                 if ChatServer.is_group(recipient):
                     media_id = store_media(username, filename, filetype, b64_data, group_id=recipient)
+                    print(f"[MEDIA UPLOAD] {username} -> group '{recipient}' | {filetype} '{filename}' | ID: {media_id}")
                 else:
                     media_id = store_media(username, filename, filetype, b64_data, recipient=recipient)
+                    print(f"[MEDIA UPLOAD] {username} -> {recipient} | {filetype} '{filename}' | ID: {media_id}")
 
                 send_framed_msg(client_socket, f"MEDIA_ID:{media_id}", 'C')
 
@@ -394,9 +461,11 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 result = get_media(media_id)
 
                 if not result:
+                    print(f"[MEDIA DOWNLOAD] {username} requested ID {media_id} | NOT FOUND")
                     send_framed_msg(client_socket, "ERROR: Media not found.", 'C')
                 else:
                     filename, filetype, b64_data = result
+                    print(f"[MEDIA DOWNLOAD] {username} requested ID {media_id} | {filetype} '{filetype}'")
                     send_framed_msg(client_socket, f"FILE:{filename}:{filetype}:{b64_data}", 'D')
 
             except ValueError:
@@ -408,12 +477,15 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         # -------------- GROUP MANAGEMENT -------------
         elif command == "CREATE_GROUP":
             created = ChatServer.create_group(recipient, username)
+            if created:
+                print(f"[GROUP CREATED] '{recipient}' by {username}")
             msg = "GROUP CREATED" if created else "GROUP EXISTS"
             send_framed_msg(client_socket, msg, 'C')
 
         elif command == "ADD_TO_GROUP":
             # 'data' holds the target username to add
             status = ChatServer.add_to_group(recipient, username, data)
+            print(f"[GROUP ADD] {username} added {data} to '{recipient}' | {status}")
             
             # Feature: System Notification for Added User
             if status == "SUCCESS":
@@ -425,10 +497,10 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
 
         elif command == "LEAVE_GROUP":
             left = ChatServer.leave_group(recipient, username)
+            print(f"[GROUP LEAVE] {username} left '{recipient}' | {'OK' if left else 'NOT MEMBER'}")
             if left:
                 # Feature: System Notification for Remaining Members
-                sys_msg = f"{username} has left the group."
-                ChatServer.send_group_message("SYSTEM", recipient, sys_msg, send_framed_msg, queue_offline_message)
+                ChatServer.send_group_message("SYSTEM", recipient, f"{username} has left the group.", send_framed_msg, queue_offline_message)
                 send_framed_msg(client_socket, "LEFT GROUP", 'C')
             else:
                 send_framed_msg(client_socket, "GROUP NOT FOUND OR NOT MEMBER", 'C')
@@ -439,14 +511,15 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
 
             if peer:
                 ip, tcp_media_port, _ = peer
-                response = f"PEER_INFO:{recipient}:{ip}:{tcp_media_port}"
-                send_framed_msg(client_socket, response, 'C')
+                print(f"[FILE TRANSFER] {username} -> {recipient} | '{filename}' | routed to {ip}:{tcp_media_port}")
+                send_framed_msg(client_socket, f"PEER_INFO:{recipient}:{ip}:{tcp_media_port}", 'C')
 
             else:
                 # Feature: Group File Sharing Support
                 if ChatServer.is_group(recipient):
                     # THE FIX: Get both online peers and offline members
                     online_peers, offline_members = ChatServer.get_group_presence(recipient, exclude_user=username)
+                    print(f"[FILE TRANSFER] {username} -> group '{recipient}' | '{filename}' | {len(online_peers)} online, {len(offline_members)} offline")
                     
                     # 1. Queue notifications for the offline members
                     for offline_user in offline_members:
@@ -465,21 +538,58 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                     if not user_exists(recipient):
                         send_framed_msg(client_socket, f"ERROR: User '{recipient}' does not exist.", 'C')
                     else:
+                        print(f"[FILE TTRANSFER] {username} -> {recipient} | '{filename}' | OFFLINE")
                         last_seen_time = ChatServer.get_last_seen(recipient)
                         send_framed_msg(client_socket, f"USER_OFFLINE:{last_seen_time}", 'C')
 
-        elif command == ("AUDIO_CALL", "VIDEO_CALL"):
+        elif command in ("AUDIO_CALL", "VIDEO_CALL"):
             peer = ChatServer.get_call_peer(recipient)
 
             if not peer:
+                print(f"[{call_type} CALL] {username} -> {recipient} | OFFLINE")
                 send_framed_msg(client_socket, f"CALLING: {recipient} is offline", 'C')
                 continue
 
             ip, udp_call_port = peer
-            response = f"CALL_PEER_INFO:{recipient}:{ip}:{udp_call_port}"
-            send_framed_msg(client_socket, response, 'C')
+            print(f"[{call_type} CALL] {username} -> {recipient} | routed to {ip}:{udp_call_port}")
+            send_framed_msg(client_socket, f"CALL_PEER_INFO:{recipient}:{ip}:{udp_call_port}", 'C')
+
+            # Also notify the recipient that an incoming call is coming,
+            # so they can prompt the user to accept or reject
+            call_type = command
+            with ChatServer.clients_lock:
+                recipient_sock = ChatServer.clients.get(recipient)
+            if recipient_sock:
+                try:
+                    send_framed_msg(recipient_sock[0], f"{call_type}:{username}", 'C')
+                except Exception:
+                    pass
+
+        # CALL_ACCEPT: callee accepted - notify the original caller to start streaming.
+        elif command == "CALL_ACCEPT":
+            print(f"[CALL ACCEPTED] {username} accepted the call from {recipient}")
+            with ChatServer.clients_lock:
+                caller_sock = ChatServer.clients.get(recipient)
+
+                if caller_sock:
+                    try:
+                        send_framed_msg(caller_sock[0], f"CALL_ACCEPTED:{username}", 'C')
+                    except Exception:
+                        pass
         
+        # CALL_REJECT: callee rejected - notify the original caller.
+        elif command == "CALL_REJECT":
+            print(f"[CALL REJECTED] {username} rejected the call from {recipient}")
+            with ChatServer.clients_lock:
+                caller_sock = ChatServer.clients.get(recipient)
+
+                if caller_sock:
+                    try:
+                        send_framed_msg(caller_sock[0], f"CALL_REJECTED:{username}", 'C')
+                    except Exception:
+                        pass
         else:
+            print(f"[UNKNOWN COMMAND] {command} from {username}")
             send_framed_msg(client_socket, "ERROR: UNKNOWN COMMAND.", 'C')
 
 
