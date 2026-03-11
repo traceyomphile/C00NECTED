@@ -1,14 +1,13 @@
 import sqlite3
 import fakeredis
 import threading
-from google.cloud import storage
 
 DB_FILE = "arcp.db"
 
 # Global lock for write safety
 db_lock = threading.Lock()
 
-# ------- SQLITE WITH CONCURRENCY
+# ------- SQLITE WITH CONCURRENCY ----------
 def get_connection(db_file: str = DB_FILE) -> sqlite3.Connection:
     # Intialise database to wait for 15 seconds if db locked by another write
     conn = sqlite3.connect(
@@ -32,10 +31,6 @@ redis_client = fakeredis.FakeRedis(
     server=_fake_server,
     decode_response=True
 )
-
-# -------- GOOGLE CLOUD STORAGE -----------
-gcs_client = storage.Client()
-bucket = gcs_client.bucket("arcp-media-storage")
 
 def initialise_database():
     conn = None
@@ -66,7 +61,21 @@ def initialise_database():
             username TEXT NOT NULL,
             PRIMARY KEY (group_id, username),
             FOREIGN KEY(group_id) REFERENCES groups(group_id),
-            FOREIGN KEY(username) REFERENCES users(username),
+            FOREIGN KEY(username) REFERENCES users(username)
+        )
+        """)
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender TEXT NOT NULL,
+            recipient TEXT,
+            group_id TEXT,
+            filename TEXT NOT NULL,
+            filetype TEXT,
+            data BLOB NOT NULL,
+            uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(sender) REFERENCES users(username)
         )
         """)
 
@@ -81,5 +90,5 @@ def initialise_database():
         if conn:
            conn.close()
 
-def get_db():
+def get_db() -> sqlite3.Connection:
     return get_connection()
