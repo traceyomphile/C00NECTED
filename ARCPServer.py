@@ -3,6 +3,7 @@ ARCP Server Implementation
 
 This module implements the ARCP server that handles client authentication, peer discovery, direct messaging, group chat management, and offline message queuing.
 The server listens for incoming TCP connections from clients, processes framed messages according to the defined protocol, and maintains global data structures for user management and message routing. It also ensures thread-safe access to shared resources using locks.
+
 Functions:
 - send_framed_msg: Frames a message with a header and sends it over a socket.
 - receive_framed_msg: Receives a framed message and returns the type and content.
@@ -14,72 +15,23 @@ Functions:
 - start_server: Initializes the TCP server and listens for incoming client connections.
 
 Integrations:
-- PostgreSQL: persistent user storage
+- SQLite: persistent user, group, and media storage
 - Redis: offline message queue and user presence
-- Google Cloud Storage: media storage
-Date: 2024-06-01
+Date: 2026-03-11
 """
 
 import socket
 import threading
 import ChatServer
-import base64
-from infrastructure import redis_client, bucket, db_lock, get_db, initialise_database
+from infrastructure import redis_client, db_lock, get_db, initialise_database
 
 
 # Server Configuration
 HOST = socket.gethostbyname(socket.gethostname())
 PORT = 50000
 
-# Global Data Structures
-db_lock: threading.Lock = threading.Lock()
-
-# Dictionary for Offline Queue: recipient -> [formatted_message_string, ...]
-redis_message_queue: dict[str, list[str]] = {} 
-
-def send_framed_msg(sock: socket.socket, message: str, msg_type: str = 'D') -> None:
-    """
-    Frames a message with a header and sends it over the socket.
-    Header Format: [Type (1 char)][Length (4 chars)]
-    Parameters:
-        - sock: The socket to send the message through.
-        - message: The content of the message to send.
-        - msg_type: A single-character indicating the type of message (e.g., 'D', 'C', 'A').
-    Returns:
-        - None
-    """
-    data = message.encode('ascii')
-    header = f"{msg_type}{len(data):04d}".encode('ascii')
-    sock.sendall(header + data)
-
-def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, None]:
-    """
-    Receives a framed message and returns the type and content.
-    Expects the same header format as send_framed_msg.
-    Parameters:
-        - sock: The socket to read from.
-    Returns:
-        - msg_type: The type of the message (e.g., 'D', 'C', 'A').
-        - message: The content of the message as a string.
-    """
-    header = sock.recv(5)
-    if not header: return None, None
-
-    msg_type = header[0:1].decode('ascii')
-    msg_len = int(header[1:5].decode('ascii'))
-    
-    data = b''
-
-    while len(data) < msg_len:
-        packet = sock.recv(msg_len - len(data))
-
-        if not packet: break
-        data += packet
-
-    return msg_type, data.decode('ascii')
-
 # ----------------------
-# POSTGRESQL FUNCTIONS
+# SQLITE FUNCTIONS
 # ----------------------
 
 def user_exists(username: str) -> bool:
@@ -88,7 +40,7 @@ def user_exists(username: str) -> bool:
     cur = conn.cursor()
 
     try:
-        cur.execute("SELECT 1 FROM users WHERE username=%s", (username,))
+        cur.execute("SELECT 1 FROM users WHERE username=?", (username,))
         return cur.fetchone() is not None
     finally:
         conn.close()
@@ -98,7 +50,7 @@ def auth_user(username: str, password: str) -> bool:
     cur = conn.cursor()
 
     try:
-        cur.execute("SELECT password FROM users WHERE username=%s", (username,))
+        cur.execute("SELECT password FROM users WHERE username=?", (username,))
 
         row = cur.fetchone()
         return row and row[0] == password
@@ -111,7 +63,7 @@ def register_user(username: str, password: str):
         cur = conn.cursor()
 
         try:
-            cur.execute("INSERT INTO users(username, password) VALUES(%s, %s)", (username, password))
+            cur.execute("INSERT INTO users(username, password) VALUES(?, ?)", (username, password))
             conn.commit()
         finally:
             conn.close()
@@ -142,37 +94,189 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
 
         send_framed_msg(client_socket, msg, 'D')
 
-# ------------------------
-# GOOGLE CLOUD STORAGE
-# ------------------------
+# -----------------------
+# Message Framing
+# -----------------------
+def send_framed_msg(sock: socket.socket, message: str, msg_type: str = 'D') -> None:
+    """
+    Frames a message with a header and sends it over the socket.
+    Header Format: [Type (1 char)][Length (4 chars)]
+    Parameters:
+        - sock: The socket to send the message through.
+        - message: The content of the message to send.
+        - msg_type: A single-character indicating the type of message (e.g., 'D', 'C', 'A').
+    Returns:
+        - None
+    """
+    data = message.encode('ascii')
+    header = f"{msg_type}{len(data):04d}".encode('ascii')
+    sock.sendall(header + data)
 
-def upload_to_gcs(filename: str, data_b64: str):
-    data = base64.b64decode(data_b64)
+def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, None]:
+    """
+    Receives a framed message and returns the type and content.
+    Expects the same header format as send_framed_msg.
+    Parameters:
+        - sock: The socket to read from.
+    Returns:
+        - msg_type: The type of the message (e.g., 'D', 'C', 'A').
+        - message: The content of the message as a string.
+    """
+    header = sock.recv(5)
 
-    blob = bucket.blob(filename)
-    blob.upload_from_string(data)
+    if not header or len(header) < 5: 
+        return None, None
 
-    return blob.public_url
-
-def download_from_gcs(filename: str):
-    blob = bucket.blob(filename)
-
-    if not blob.exists():
-        return None
+    msg_type = header[0:1].decode('ascii')
+    msg_len = int(header[1:5].decode('ascii'))
     
-    data = blob.download_as_bytes()
-    return base64.b64encode(data).decode()
+    data = b''
+
+    while len(data) < msg_len:
+        packet = sock.recv(msg_len - len(data))
+
+        if not packet: break
+        data += packet
+
+    return msg_type, data.decode('ascii')
+
+# -----------------------------
+# MEDIA STORAGE AND RETRIEVAL
+# -----------------------------
+
+def store_media(sender: str, filename: str, filetype: str, data_b64: str, recipient=None, group_id=None) -> int:
+    """
+    Stores a base64-encoded media file in SQLite media table.
+    Parameters:
+        - sender : The username of the uploading client.
+        - filename : Original filename (e.g. "photo.jpg").
+        - filetype : File type category (e.g. 'image', 'audio', 'video', 'pdf').
+        - data_b64 : The base64-encoded data of the media file.
+        - recipient : The username of the recipient (mutually exclusive with group_id).
+        - group_id : The ID of the group (mutually exclusive with recipient).
+    Returns:
+        - media_id : The unique ID of the stored media record.
+    """
+    with db_lock:
+        conn = get_db()
+        cur = conn.cursor()
+
+        try:
+            cur.execute("""
+            INSERT INTO media (sender, recipient, group_id, filename, filetype, data)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """, (sender, recipient, group_id, filename, filetype, data_b64))
+
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+def get_media(media_id: int) -> tuple[str, str, str] | None:
+    """
+    Retrieves a stored media file from the SQLite media table by its ID.
+    Parameters:
+        - media_id : The unique ID of the media record to retrieve.
+    Returns:
+        - A tuple containing (filename, filetype, data) if found, or None if not found.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            "SELECT filename, filetype, data FROM media WHERE id=?",
+            (media_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return row["filename"], row["filetype"], row["data"]
+
+    finally:
+        conn.close()
 
 # ---------------------
 # CLIENT HANDLING
 # ---------------------
 
+def authenticate_client(client_socket: socket.socket, addr) -> str | None:
+    """
+    Handles the authentication process for a new client connection.
+    Parameters:
+        - client_socket : The socket representing the client's connection.
+        - addr : The address of the client.
+    Returns:
+        - The authenticated username, or None if authentication fails.
+    """
+    username = None
+
+    while True:
+        _, msg = receive_framed_msg(client_socket)
+        if not msg: 
+            return None# Disconnected during auth
+        
+        if msg.startswith("CHECK:"):
+
+            check_user = msg.split(":")[1]
+
+            if user_exists(check_user):
+                send_framed_msg(client_socket, "EXISTS", 'A')
+            else:
+                send_framed_msg(client_socket, "NOT_FOUND", 'A')
+                
+        elif msg.startswith("LOGIN:"):
+            _, login_user, login_pwd = msg.split(":", 2)
+
+            if not auth_user(login_user, login_pwd):
+                send_framed_msg(client_socket, "FAIL", 'A')
+                continue
+
+            if ChatServer.get_user_presence(login_user):
+                send_framed_msg(client_socket, "ALREADY ONLINE", 'A')
+                continue
+
+            username = login_user
+            send_framed_msg(client_socket, "SUCCESS", 'A')
+            break
+                      
+        elif msg.startswith("REG:"):
+            _, reg_user, reg_pwd = msg.split(":", 2)
+
+            if user_exists(reg_user):
+                send_framed_msg(client_socket, "USER_EXISTS", 'A')
+                continue
+
+            register_user(reg_user, reg_pwd)
+
+            username = reg_user
+            send_framed_msg(client_socket, "SUCCESS", 'A')
+            break
+
+    # Client sends PORT: (TCP media port) then CALL_PORT: (UDP call port) after auth
+    _, port_msg = receive_framed_msg(client_socket)
+    tcp_media_port = int(port_msg.split(":")[1])
+
+    _, call_port_msg = receive_framed_msg(client_socket)
+    udp_call_port = int(call_port_msg.split(":")[1])
+
+    # Register with the global ChatServer logic using both ports.
+    ChatServer.register_client(username, client_socket, addr[0], tcp_media_port, udp_call_port)
+    ChatServer.set_user_online(username, addr[0], tcp_media_port, udp_call_port)
+
+    print(f"[REGISTERED] {username} at {addr[0]} | TCP Media : {tcp_media_port} | UDP Call : {udp_call_port}")
+    
+    # Immediately flush any offline messages waiting for them
+    flush_redis_queue(client_socket, username)
+
+    return username
+
 def handle_client(client_socket: socket.socket, addr) -> None:
     """
     Handles the lifecycle of a client connection, including authentication and message processing.
     Parameters:
-        - client_socket: The socket representing the client's connection.
-        - addr: The address of the client.
+        - client_socket : The socket representing the client's connection.
+        - addr : The address of the client.
     Returns:
         - None
     """
@@ -193,8 +297,9 @@ def handle_client(client_socket: socket.socket, addr) -> None:
     finally:
         client_socket.close()
 
-        if username and ChatServer.get_user_presence(username) is not None: 
-            ChatServer.set_user_offline(username)
+        if username: 
+            ChatServer.remove_client(username)
+
             print(f"[DISCONNECTED] {username}")
 
 # ----------------
@@ -241,28 +346,57 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 send_framed_msg(client_socket, f"DELIVERED", 'C')
             else:
                 last_seen_time = ChatServer.get_last_seen(recipient)
-                send_framed_msg(client_socket, f"USER OFFLINE. {ChatServer.format_last_seen(last_seen_time)}", 'C')
-
-        # ----- MEDIA UPLOAD --------
-        elif command == "UPLOAD_MEDIA":
-            filename, filedata = data.split("|", 1)
-            url = upload_to_gcs(filename, filedata)
-            send_framed_msg(client_socket, f"MEDIA_URL:{url}", 'C')
-
-        # ----- MEDIA DOWNLOAD -------
-        elif command == "DOWNLOAD_MEDIA":
-            filedata = download_from_gcs(data)
-
-            if not filedata:
-                send_framed_msg(client_socket, "ERROR: FILE NOT FOUND", 'C')
-            else:
-                send_framed_msg(client_socket, f"FILE:{filedata}", 'D')
+                send_framed_msg(client_socket, f"USER OFFLINE. {last_seen_time}", 'C')
         
         elif command == "SEND_GROUP":
             status = ChatServer.send_group_message(username, recipient, data, send_framed_msg, queue_offline_message)
             if status != "SUCCESS":
                 send_framed_msg(client_socket, f"ERROR: {status}", 'C')
 
+        # --------- MEDIA UPLOAD ---------
+        # Client sends: UPLOAD_MEDIA:<recipient_or_group>:<filename>|<base64_data>
+        # Server replies: MEDIA_ID:<id> - the client can share this ID so the recipient can download.
+        elif command == "UPLOAD_MEDIA":
+            try:
+                parts_data = data.split("|", 2)
+                if len(parts_data) != 3:
+                    send_framed_msg(client_socket, "ERROR: Format: UPLOAD_MEDIA:<target>:<filename>|<base64_data>", 'C')
+                    continue
+
+                filename, filetype, b64_data = parts_data
+
+                # Determine whether the target is a group or a user
+                if ChatServer.is_group(recipient):
+                    media_id = store_media(username, filename, filetype, b64_data, group_id=recipient)
+                else:
+                    media_id = store_media(username, filename, filetype, b64_data, recipient=recipient)
+
+                send_framed_msg(client_socket, f"MEDIA_ID:{media_id}", 'C')
+
+            except Exception as e:
+                send_framed_msg(client_socket, f"ERROR: Media upload failed: {str(e)}", 'C')
+
+        # ------------- MEDIA DOWNLOAD -----------
+        # Client sends: DOWNLOAD_MEDIA:<media_id>
+        # Server replies: FILE:<filename>:<filetype>:<base64_data> or ERROR: ....
+        elif command == "DOWNLOAD_MEDIA":
+            try:
+                media_id = int(recipient)
+                result = get_media(media_id)
+
+                if not result:
+                    send_framed_msg(client_socket, "ERROR: Media not found.", 'C')
+                else:
+                    filename, filetype, b64_data = result
+                    send_framed_msg(client_socket, f"FILE:{filename}:{filetype}:{b64_data}", 'D')
+
+            except ValueError:
+                send_framed_msg(client_socket, "ERROR: Invalid media ID.", 'C')
+
+            except Exception as e:
+                send_framed_msg(client_socket, f"ERROR: Media download failed: {str(e)}", 'C')
+
+        # -------------- GROUP MANAGEMENT -------------
         elif command == "CREATE_GROUP":
             created = ChatServer.create_group(recipient, username)
             msg = "GROUP CREATED" if created else "GROUP EXISTS"
@@ -276,6 +410,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             if status == "SUCCESS":
                 sys_msg = f"You were added to group '{recipient}' by {username}."
                 ChatServer.send_dm("SYSTEM", data, sys_msg, send_framed_msg, queue_offline_message)
+                ChatServer.send_group_message("SYSTEM", recipient, f"{username} added {data} to the group.", send_framed_msg, queue_offline_message)
                 
             send_framed_msg(client_socket, f"ADD_STATUS: {status}", 'C')
 
@@ -290,14 +425,14 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 send_framed_msg(client_socket, "GROUP NOT FOUND OR NOT MEMBER", 'C')
 
         elif command == "GET_PEER":
-            peer = ChatServer.get_peer_info(recipient)
+            peer = ChatServer.get_user_presence(recipient)
             filename = data if data else "a file" # Extract the filename from the new client format
 
             if peer:
-                # Target is an individual online user
-                _, ip, port = peer
-                response = f"PEER_INFO:{recipient}:{ip}:{port}"
+                ip, tcp_media_port, _ = peer
+                response = f"PEER_INFO:{recipient}:{ip}:{tcp_media_port}"
                 send_framed_msg(client_socket, response, 'C')
+
             else:
                 # Feature: Group File Sharing Support
                 if ChatServer.is_group(recipient):
@@ -319,78 +454,26 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 else:
                     # Feature: Prevent sending files to non-existent users
                     if not user_exists(recipient):
-                        send_framed_msg(client_socket, f"ERROR: User '{recipient}' does not exist in the system.", 'C')
+                        send_framed_msg(client_socket, f"ERROR: User '{recipient}' does not exist.", 'C')
                     else:
                         last_seen_time = ChatServer.get_last_seen(recipient)
-                        send_framed_msg(client_socket, f"ERROR: User '{recipient}' is OFFLINE. Last seen at {last_seen_time}", 'C')
+                        send_framed_msg(client_socket, f"USER_OFFLINE:{last_seen_time}", 'C')
+
+        elif command == ("AUDIO_CALL", "VIDEO_CALL"):
+            peer = ChatServer.get_call_peer(recipient)
+
+            if not peer:
+                send_framed_msg(client_socket, f"CALLING: {recipient} is offline", 'C')
+                continue
+
+            ip, udp_call_port = peer
+            response = f"CALL_PEER_INFO:{recipient}:{ip}:{udp_call_port}"
+            send_framed_msg(client_socket, response, 'C')
         
         else:
             send_framed_msg(client_socket, "ERROR: UNKNOWN COMMAND.", 'C')
 
-def authenticate_client(client_socket: socket.socket, addr) -> str | None:
-    """
-    Handles the authentication process for a new client connection.
-    Parameters:
-        - client_socket: The socket representing the client's connection.
-        - addr: The address of the client.
-    Returns:
-        - The authenticated username, or None if authentication fails.
-    """
-    while True:
-        _, msg = receive_framed_msg(client_socket)
-        if not msg: return None# Disconnected during auth
-        
-        if msg.startswith("CHECK:"):
-            check_user = msg.split(":")[1]
-            if not user_exists(check_user):
-                send_framed_msg(client_socket, "EXISTS", 'A')
-            else:
-                send_framed_msg(client_socket, "NOT_FOUND", 'A')
-                
-        elif msg.startswith("LOGIN:"):
-            _, login_user, login_pwd = msg.split(":", 2)
-            if not auth_user(login_user, login_pwd):
-                send_framed_msg(client_socket, "FAIL", 'A')
-                continue
 
-            with db_lock:
-                if ChatServer.get_peer_info(login_user):
-                    send_framed_msg(client_socket, "ALREADY ONLINE", 'A')
-                    continue
-
-            username = login_user
-            send_framed_msg(client_socket, "SUCCESS", 'A')
-            ChatServer.set_user_online(username, addr[0], udp_port)
-            break # Exit auth loop!
-                
-                
-        elif msg.startswith("REG:"):
-            _, reg_user, reg_pwd = msg.split(":", 2)
-
-            with db_lock:
-                if user_exists(reg_user):
-                    send_framed_msg(client_socket, "USER_EXISTS", 'A')
-                    continue
-
-                register_user(reg_user, reg_pwd)
-
-            username = reg_user
-            send_framed_msg(client_socket, "SUCCESS", 'A')
-            ChatServer.set_user_online(username, addr[0], udp_port)
-            break # Exit auth loop!
-
-    # Receive the dynamically assigned UDP port after login
-    _, port_msg = receive_framed_msg(client_socket)
-    udp_port = int(port_msg.split(":")[1])
-    
-    # Register with the Global ChatServer logic
-    ChatServer.register_client(username, client_socket, addr[0], udp_port)
-    print(f"[REGISTERED] {username} at {addr[0]}:{udp_port}")
-    
-    # Immediately flush any offline messages waiting for them
-    flush_redis_queue(client_socket, username)
-
-    return username
     
 def start_server() -> None:
     """
@@ -399,9 +482,10 @@ def start_server() -> None:
     """
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind((HOST, PORT))
+    initialise_database()
     server.listen()
     print(f"Server listening on {HOST}:{PORT}...")
-    initialise_database()
+
     
     while True:
         conn, addr = server.accept()
