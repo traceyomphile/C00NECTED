@@ -61,7 +61,7 @@ def initialise_database():
             username TEXT NOT NULL,
             PRIMARY KEY (group_id, username),
             FOREIGN KEY(group_id) REFERENCES groups(group_id),
-            FOREIGN KEY(username) REFERENCES users(username),
+            FOREIGN KEY(username) REFERENCES users(username)
         )
         """)
 
@@ -90,5 +90,5 @@ def initialise_database():
         if conn:
            conn.close()
 
-def get_db():
+def get_db() -> sqlite3.Connection:
     return get_connection()
