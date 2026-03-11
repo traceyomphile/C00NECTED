@@ -721,21 +721,22 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
                     if check_resp == "EXISTS":
                         print("[ERROR] Username already taken. Try another.")
                     else:
-                        new_pwd = input("Enter new password: ").strip()
-                        send_framed_msg(tcp_sock, f"REG:{new_user}:{new_pwd}", 'A')
-                        _, reg_resp = receive_framed_msg(tcp_sock)
-                        
-                        if reg_resp == "SUCCESS":
-                            print("\n[SYSTEM] Registration successful! Welcome to the Chat.")
-                            return 
-                        
-                        elif reg_resp.startswith("WEAK_PASSWORD:"):
-                            reason = reg_resp.split(":", 1)[1]
-                            print(f"[ERROR] {reason}")
-                            print(f"[INFO] Requirements: 8+ chars, uppercase, lowercase, digit, special character (e.g. !@#$..)")
-                        else:
-                            print(f"[ERROR] Registration failed: {reg_resp}")
-                            break
+                        while True:
+                            new_pwd = input("Enter new password: ").strip()
+                            send_framed_msg(tcp_sock, f"REG:{new_user}:{new_pwd}", 'A')
+                            _, reg_resp = receive_framed_msg(tcp_sock)
+                            
+                            if reg_resp == "SUCCESS":
+                                print("\n[SYSTEM] Registration successful! Welcome to the Chat.")
+                                return new_user
+                            
+                            elif reg_resp.startswith("WEAK_PASSWORD:"):
+                                reason = reg_resp.split(":", 1)[1]
+                                print(f"[ERROR] {reason}")
+                                print(f"[INFO] Requirements: 8+ chars, uppercase, lowercase, digit, special character (e.g. !@#$..)")
+                            else:
+                                print(f"[ERROR] Registration failed: {reg_resp}")
+                                break
             else:
                 return None # Exits program if they decline registration
 
