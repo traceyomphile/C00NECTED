@@ -319,6 +319,9 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         _, full_message = receive_framed_msg(client_socket)
         if not full_message: break
 
+        # Refresh the sender's redis presence TTL on every message to keep them marked as online.
+        ChatServer.refresh_presence(username)
+
         print(f"[RECEIVED] {full_message} from {username}")
         parts = full_message.split(":", 2)
 

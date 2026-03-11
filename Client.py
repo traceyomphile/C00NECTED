@@ -40,6 +40,10 @@ import pyaudio
 import cv2
 import pickle
 
+# ----------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------
+
 SERVER_IP = socket.gethostbyname(socket.gethostname())
 TCP_PORT = 50000
 
@@ -733,7 +737,7 @@ def print_commands():
         "       Images: .jpg .jpeg .png ..gif .bmp .webp\n"
         "       PDF   : .pdf\n"
         "       Audio : .mp3 .wav .flac .ogg .aac\n"
-        "       Video : .mp4 .avi .mov .mkv .webm (max {MAX_VIDEO_SECONDS}s)\n"
+        f"       Video : .mp4 .avi .mov .mkv .webm (max {MAX_VIDEO_SECONDS}s)\n"
         "AUDIO_CALL:<user>                - Start an audio call (UDP)\n"
         "VIDEO_CALL:<user>                - Start a video call (UDP)\n"
         "CALL_END                         - End the current call\n"
