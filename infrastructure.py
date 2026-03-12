@@ -1,6 +1,9 @@
 import sqlite3
 import fakeredis
 import threading
+import hashlib
+import hmac
+import os
 
 DB_FILE = "arcp.db"
 
@@ -25,13 +28,51 @@ def get_connection(db_file: str = DB_FILE) -> sqlite3.Connection:
 
     return conn
 
+def get_db() -> sqlite3.Connection:
+    return get_connection()
+
 # ------- REDIS ----------
 _fake_server = fakeredis.FakeServer()
 redis_client = fakeredis.FakeRedis(
     server=_fake_server,
-    decode_response=True
+    decode_responses=True # <-- FIX: Changed from decode_response to decode_responses
 )
 
+# --------------- PASSWORD HASHING ---------------
+def hash_password(password: str) -> str:
+    """
+    Hashes a plainttext password with SHA-256 and a fresh 32-byte random salt.
+    Returns a "salt_hex:hash_hex" string for storage in the database.
+    A new salt is generated on every call, so two users with the same password 
+    will produce a different hash each time.
+    Parameters:
+        - password : A string representing the password to hash.
+    Returns:
+        - A "salt_hex:hash_hex" string.
+    """
+    salt = os.urandom(16)
+    digest = hashlib.sha256(salt + password.encode('utf-8')).hexdigest()
+    return f"{salt.hex()}:{digest}"
+
+def verify_password(password: str, stored: str) -> bool:
+    """
+    Checks if the given password matches the stored "salt_hex:hash_hex" value.
+    Uses hmac.compare_digest for a timing-safe comparison so the check takes constant time.
+    Parameters:
+        - password : A string representing plaintext password
+        - stored : A string representing the stored encrypted password.
+    Returns:
+        - True of password == stored "salt_hex:hash_hex"
+    """
+
+    try:
+        salt_hex, expected_digest = stored.split(":", 1)
+        salt = bytes.fromhex(salt_hex)
+        actual_digest = hashlib.sha256(salt + password.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(actual_digest, expected_digest)
+    except Exception:
+        return False
+    
 def initialise_database():
     conn = None
 
@@ -89,6 +130,3 @@ def initialise_database():
     finally:
         if conn:
            conn.close()
-
-def get_db() -> sqlite3.Connection:
-    return get_connection()
