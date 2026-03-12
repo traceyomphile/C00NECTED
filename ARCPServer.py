@@ -572,7 +572,6 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             else:
                 # Feature: Group File Sharing Support
                 if ChatServer.is_group(recipient):
-                    # THE FIX: Get both online peers and offline members
                     online_peers, offline_members = ChatServer.get_group_presence(recipient, exclude_user=username)
                     print(f"[FILE TRANSFER] {username} -> group '{recipient}' | '{filename}' | {len(online_peers)} online, {len(offline_members)} offline")
                     
@@ -642,6 +641,10 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                     except Exception:
                         pass
         
+        # --------- FLUSH OFFLINE QUEUE --------------
+        elif command == "FLUSH_OFFLINE":
+            flush_redis_queue(client_socket, username)
+            
         elif command == "EXIT":
             print(f"[EXIT] {username} disconnected gracefully.")
             break

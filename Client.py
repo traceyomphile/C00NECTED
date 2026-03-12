@@ -924,6 +924,9 @@ def start_client() -> None:
     threading.Thread(target=receive_tcp_messages, args=(tcp_sock, udp_sock), daemon=True).start()
     threading.Thread(target=listen_for_call_udp, args=(udp_sock,), daemon=True).start()
 
+    # 6b. Ask the server to flush any message/files queued while we were offline.
+    send_framed_msg(tcp_sock, "FLUSH_OFFLINE:", 'C')
+
     # 7. Main command loop
     while True:
         try:
@@ -935,7 +938,7 @@ def start_client() -> None:
             continue
 
         if msg.upper() == "EXIT":
-            send_framed_msg(tcp_sock, "EXIT", 'C')
+            send_framed_msg(tcp_sock, "EXIT:", 'C')
             break
 
         if msg.upper() == "COMMANDS":
@@ -1036,9 +1039,25 @@ def start_client() -> None:
         
         else:
             print("[ERROR] Unknown command. Type COMMANDS for help.")
-    # Shutdown
+    
+    # Shutdown: Signal the background receive thread to stop by shutting down the TCP socket before closing it.
+    try:
+        tcp_sock.shutdown(socket.SHUT_RDWR)
+    except:
+        pass
+
     tcp_sock.close()
-    udp_sock.close()
+
+    try:
+        media_sock.close()
+    except Exception:
+        pass
+
+    try:
+        udp_sock.close()
+    except Exception:
+        pass
+    
     print("[SYSTEM] Disconnected.")
 
 if __name__ == "__main__":
