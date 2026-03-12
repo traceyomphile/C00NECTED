@@ -35,7 +35,7 @@ def get_db() -> sqlite3.Connection:
 _fake_server = fakeredis.FakeServer()
 redis_client = fakeredis.FakeRedis(
     server=_fake_server,
-    decode_response=True
+    decode_responses=True # <-- FIX: Changed from decode_response to decode_responses
 )
 
 # --------------- PASSWORD HASHING ---------------

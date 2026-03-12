@@ -148,9 +148,14 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
         if not msg:
             break
 
+        # FIX: Ensure msg is decoded to a string if fakeredis returns bytes
+        if isinstance(msg, bytes):
+            msg = msg.decode('utf-8', errors='replace')
+
         try:
             send_framed_msg(client_socket, msg, 'D')
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] Failed to flush offline message for {recipient}: {e}")
             redis_client.lpush(key, msg)    # Re-queue on failure and stop
             break
 
@@ -590,7 +595,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                     if not user_exists(recipient):
                         send_framed_msg(client_socket, f"ERROR: User '{recipient}' does not exist.", 'C')
                     else:
-                        print(f"[FILE TTRANSFER] {username} -> {recipient} | '{filename}' | OFFLINE")
+                        print(f"[FILE TRANSFER] {username} -> {recipient} | '{filename}' | OFFLINE")
                         last_seen_time = ChatServer.get_last_seen(recipient)
                         send_framed_msg(client_socket, f"STORE_OFFLINE:{recipient}:{last_seen_time}", 'C')
 
