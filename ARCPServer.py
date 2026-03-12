@@ -145,7 +145,7 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
 
     while True:
         msg = redis_client.lpop(key)
-        if not msg:
+        if msg is None:
             break
 
         # FIX: Ensure msg is decoded to a string if fakeredis returns bytes
@@ -153,7 +153,19 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
             msg = msg.decode('utf-8', errors='replace')
 
         try:
-            send_framed_msg(client_socket, msg, 'D')
+            if msg.startswith("MEDIA_WAITING"):
+                _, media_id, sender, filename = msg.split(":", 3)
+
+                result = get_media(int(media_id))
+                if result:
+                    filename, filetype, b64_data = result
+                    send_framed_msg(
+                        client_socket,
+                        f"FILE:{filename}:{filetype}:{b64_data}",
+                        'D'
+                    )
+            else:
+                send_framed_msg(client_socket, msg, 'D')
         except Exception as e:
             print(f"[ERROR] Failed to flush offline message for {recipient}: {e}")
             redis_client.lpush(key, msg)    # Re-queue on failure and stop
@@ -351,9 +363,6 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
 
         print(f"[REGISTERED] {username} at {addr[0]} | TCP Media : {tcp_media_port} | UDP Call : {udp_call_port}")
         
-        # Immediately flush any offline messages waiting for them
-        flush_redis_queue(client_socket, username)
-
         return username
     
     except Exception as e:
@@ -381,6 +390,9 @@ def handle_client(client_socket: socket.socket, addr) -> None:
         if not username:
             return # Authentication failed or client disconnected
         
+        # Immediately flush any offline messages waiting for them
+        flush_redis_queue(client_socket, username)
+
         # Implement chat logic
         main_chat_loop(client_socket, username)
                             
@@ -463,8 +475,14 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 send_framed_msg(client_socket, f"USER OFFLINE. {last_seen_time}", 'C')
         
         elif command == "SEND_GROUP":
+            if not ChatServer.is_group(recipient):
+                send_framed_msg(client_socket, f"ERROR: Group '{recipient}' does not exists.", 'C')
+                continue
+
             print(f"[GROUP MESSAGE] {username} -> group '{recipient}'")
+
             status = ChatServer.send_group_message(username, recipient, data, send_framed_msg, queue_offline_message)
+            
             if status != "SUCCESS":
                 send_framed_msg(client_socket, f"ERROR: {status}", 'C')
 
@@ -495,7 +513,26 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                         conn.close()
                     
                     for member in members:
-                        if member != username and not ChatServer.get_user_presence(member):
+                        if member == username:
+                            continue
+
+                        peer = ChatServer.get_user_presence(member)
+
+                        if peer:
+                            with ChatServer.clients_lock:
+                                recipient_sock = ChatServer.clients.get(member)
+
+                            if recipient_sock:
+                                try:
+                                    send_framed_msg(
+                                        recipient_sock[0],
+                                        f"FILE:{filename}:{filetype}:{b64_data}",
+                                        'D'
+                                    )
+                                except Exception:
+                                    pass
+
+                        else:
                             queue_offline_message(member, f"MEDIA_WAITING:{media_id}:{username}:{filename}")
 
                 else:

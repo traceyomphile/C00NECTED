@@ -70,6 +70,7 @@ AUDIO_CHUNK = 1024
 # --------------------------------------------------
 # CALL STATE (MODULE-LEVEL SO THREADS CAN SHARE IT)
 # ---------------------------------------------------
+pending_caller = None
 call_ended = False
 call_udp_sock: socket.socket | None = None      # The single UDP socket used for a call
 call_peer_addr: tuple | None = None
@@ -359,18 +360,35 @@ def stream_audio(udp_sock: socket.socket, peer_addr: tuple) -> None:
         frames_per_buffer=AUDIO_CHUNK
     )
 
+    udp_sock.setblocking(False)
+
     try:
         while not call_ended:
-            pcm_data = stream.read(AUDIO_CHUNK, exception_on_overflow=False)
-            udp_sock.sendto(PKT_AUDIO + pcm_data, peer_addr)
-    
+            try:
+                pcm_data = stream.read(AUDIO_CHUNK, exception_on_overflow=False)
+            except Exception:
+                continue
+
+            packet = PKT_AUDIO + pcm_data
+
+            try:
+                udp_sock.sendto(packet, peer_addr)
+            except OSError:
+                if not call_ended:
+                    print("[CALL] UDP send failed")
+                    break
+
     except Exception as e:
         if not call_ended:
             print(f"[CALL] Audio send error: {e}")
     
     finally:
-        stream.stop_stream()
-        stream.close()
+        try:
+            stream.stop_stream()
+            stream.close()
+        except Exception:
+            pass
+
         audio.terminate()
 
 def receive_audio(udp_sock: socket.socket) -> None:
@@ -395,25 +413,36 @@ def receive_audio(udp_sock: socket.socket) -> None:
         frames_per_buffer=AUDIO_CHUNK
     )
 
+    # Set timeout so recvfrom doesn't block forever
+    udp_sock.settimeout(0.5)
+
     try:
         while not call_ended:
             try:
                 datagram, _ = udp_sock.recvfrom(65535)
             except socket.timeout:
                 continue
+            except Exception as e:
+                if not call_ended:
+                    print(f"[CALL] UDP receive error: {e}")
             
             if not datagram:
-                break
+                continue
             
             pkt_type = datagram[0:1]
+            payload = datagram[1:]
+
             if pkt_type == PKT_END:
                 break
             if pkt_type == PKT_AUDIO:
-                stream.write(datagram[1:])
+                if payload:
+                    try:
+                        stream.write(payload)
+                    except Exception as e:
+                        print(f"[CALL] Audio playback error: {e}")
+            else:
+                continue
 
-    except Exception as e:
-        if not call_ended:
-            print(f"[CALL] Audio receive error: {e}")
     finally:
         stream.stop_stream()
         stream.close()
@@ -667,28 +696,29 @@ def receive_tcp_messages(sock: socket.socket, my_udp_socket: socket.socket) -> N
 
             # ------- Call Signalling: Incoming Call Notification -----------
             if msg.startswith("AUDIO_CALL:") or msg.startswith("VIDEO_CALL:"):
+                global pending_caller  #I was here
+                
                 caller = msg.split(":")[1]
+                pending_caller = caller
                 call_type = "audio" if msg.startswith("AUDIO_CALL:") else "video"
 
                 print(f"\n[CALL] Incoming {call_type} call from {caller}")
-
-                choice = input("Accept call? (y/n): ")
-
-                if choice.lower() == "y":
-                    send_framed_msg(sock, f"CALL_ACCEPT:{caller}", 'C')
-                else:
-                    send_framed_msg(sock, f"CALL_REJECT:{caller}", 'C')
-                continue
+                print("Type ACCEPT_CALL or REJECT_CALL")
 
             # ----------- Call SignallingL Server returns Peer UDP address --------------
             if msg_type == 'C' and msg.startswith("CALL_PEER_INFO:"):
-                _, peer_user, peer_ip, peer_udp_port = msg.split(":")
+                parts = msg.split(":")
+
+                peer_user = parts[1]
+                peer_ip = parts[2]
+                peer_udp_port = int(parts[3])
+                call_type = parts[4]
 
                 print(f"\n[CALL] Ringing {peer_user}")
 
                 threading.Thread(
                     target=start_call_udp,
-                    args=(peer_ip, int(peer_udp_port), my_udp_socket),
+                    args=(peer_ip, peer_udp_port, my_udp_socket),
                     daemon=True
                 ).start()
                 continue
@@ -696,7 +726,9 @@ def receive_tcp_messages(sock: socket.socket, my_udp_socket: socket.socket) -> N
             # ----- Call Signalling: callee accepted our call ---------
             if msg_type == 'C' and msg.startswith("CALL_ACCEPTED:"):
                 callee = msg.split(":")[1]
-                print(f"\n[CALL] {callee} accepted your call! Streaming started.")
+                print(f"\n[CALL] {callee} accepted your call!")
+
+                send_framed_msg(sock, f"GET_CALL_PEER:{callee}", 'C')
                 continue
 
             # ----- Call Signalling: callee rejected our call ---------
@@ -928,7 +960,6 @@ def start_client() -> None:
     # 6. Background threads
     threading.Thread(target=receive_tcp_media, args=(media_sock,), daemon=True).start()
     threading.Thread(target=receive_tcp_messages, args=(tcp_sock, udp_sock), daemon=True).start()
-    threading.Thread(target=listen_for_call_udp, args=(udp_sock,), daemon=True).start()
 
     # 6b. Ask the server to flush any message/files queued while we were offline.
     send_framed_msg(tcp_sock, "FLUSH_OFFLINE:", 'C')
@@ -1040,6 +1071,18 @@ def start_client() -> None:
                 except Exception:
                     pass
             print("[CALL] Call ended.")
+
+        elif command == "ACCEPT_CALL":
+            if pending_caller:
+                send_framed_msg(tcp_sock, f"CALL_ACCEPT:{pending_caller}", 'C')
+            else:
+                print("No incoming call.")
+            pending_caller = None
+
+        elif command == "REJECT_CALL":
+            if pending_caller:
+                send_framed_msg(tcp_sock, f"CALL_REJECT:{pending_caller}", 'C')
+                pending_caller = None
 
         # ------------- Internal peer lookup (manual / debug) -----------
         elif command == "GET_PEER":

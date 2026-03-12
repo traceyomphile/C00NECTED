@@ -178,12 +178,25 @@ def format_last_seen(delta: datetime):
         return "last seen just now"
     
     if seconds < 3600:
-        return f"last seen {seconds // 60} minutes ago"
+        mins = seconds // 60
+        if mins == 1:
+            return f"last seen {mins} minute ago"
+        else:
+            return f"last seen {mins} minutes ago"
     
     if seconds < 86400:
-        return f"last seen {seconds // 3600} hours ago"
+        hours = seconds // 3600
+        if hours == 1:
+            return f"last seen {hours} hour ago"
+        else:
+            return f"last seen {hours} hours ago"
     
-    return f"last seen {seconds // 86400} days ago"
+    else:
+        days = seconds // 86400
+        if days == 1:
+            return f"last seen {days} day ago"
+        else:
+            return f"last seen {days} days ago"
 
 # --------------------------------------
 # CLIENT REGISTRATION (MEMORY)
