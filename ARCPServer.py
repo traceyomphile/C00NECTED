@@ -24,12 +24,15 @@ import socket
 import threading
 import re
 import ChatServer
-from infrastructure import redis_client, db_lock, get_db, initialise_database
+from infrastructure import redis_client, db_lock, get_db, initialise_database, hash_password, verify_password
 
 
 # Server Configuration
 HOST = socket.gethostbyname(socket.gethostname())
 PORT = 50000
+
+# Disconnect a client after 20 minutes of inactivity to free up resources.
+INACTIVITY_TIMEOUT = 20 * 60
 
 # ----------------------
 # SQLITE FUNCTIONS
@@ -52,19 +55,20 @@ def auth_user(username: str, password: str) -> bool:
 
     try:
         cur.execute("SELECT password FROM users WHERE username=?", (username,))
-
         row = cur.fetchone()
-        return row and row[0] == password
+
+        return verify_password(password, row[0])
     finally:
         conn.close()
     
 def register_user(username: str, password: str):
+    hashed = hash_password(password)
     with db_lock:
         conn = get_db()
         cur = conn.cursor()
 
         try:
-            cur.execute("INSERT INTO users(username, password) VALUES(?, ?)", (username, password))
+            cur.execute("INSERT INTO users(username, password) VALUES(?, ?)", (username, hashed))
             conn.commit()
         finally:
             conn.close()
@@ -115,7 +119,7 @@ def validate_password(password: str) -> tuple[bool, str]:
     if not re.search(r'\d', password):
         return False, "Password must contain at least one digit."
 
-    if not re.search(r'[!@#$%^&*()_+|-=\[\]{};\'\\:"|,.<>/?`~]', password):
+    if not re.search(r'[!@#$%^&*()_+|-=\[\]{};\'\\"|,.<>/?`~]', password):
         return False, "Password must contain at least one special character."
     
     return True, ""
@@ -263,74 +267,93 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
     """
     username = None
 
-    while True:
-        _, msg = receive_framed_msg(client_socket)
-        if not msg: 
-            return None# Disconnected during auth
-        
-        if msg.startswith("CHECK:"):
+    try:
+        while True:
+            _, msg = receive_framed_msg(client_socket)
+            if not msg: 
+                return None# Disconnected during auth
+            
+            if msg.startswith("CHECK:"):
 
-            check_user = msg.split(":")[1]
+                check_user = msg.split(":")[1]
 
-            if user_exists(check_user):
-                send_framed_msg(client_socket, "EXISTS", 'A')
+                if user_exists(check_user):
+                    send_framed_msg(client_socket, "EXISTS", 'A')
+                else:
+                    send_framed_msg(client_socket, "NOT_FOUND", 'A')
+                    
+            elif msg.startswith("LOGIN:"):
+                _, login_user, login_pwd = msg.split(":", 2)
+
+                if not auth_user(login_user, login_pwd):
+                    send_framed_msg(client_socket, "FAIL", 'A')
+                    continue
+
+                if ChatServer.get_user_presence(login_user):
+                    send_framed_msg(client_socket, "ALREADY ONLINE", 'A')
+                    continue
+
+                username = login_user
+                send_framed_msg(client_socket, "SUCCESS", 'A')
+                break
+                        
+            elif msg.startswith("REG:"):
+                _, reg_user, reg_pwd = msg.split(":", 2)
+
+                if user_exists(reg_user):
+                    send_framed_msg(client_socket, "USER_EXISTS", 'A')
+                    continue
+
+                ok, reason = validate_password(reg_pwd)
+                if not ok:
+                    send_framed_msg(client_socket, f"WEAK_PASSWORD:{reason}", 'A')
+                    continue
+
+                register_user(reg_user, reg_pwd)
+                print(f"[REGISTERED USER] {reg_user}")
+
+                username = reg_user
+                send_framed_msg(client_socket, "SUCCESS", 'A')
+                break
+            
             else:
-                send_framed_msg(client_socket, "NOT_FOUND", 'A')
-                
-        elif msg.startswith("LOGIN:"):
-            _, login_user, login_pwd = msg.split(":", 2)
-
-            if not auth_user(login_user, login_pwd):
-                send_framed_msg(client_socket, "FAIL", 'A')
                 continue
 
-            if ChatServer.get_user_presence(login_user):
-                send_framed_msg(client_socket, "ALREADY ONLINE", 'A')
-                continue
+        # Force-clear any stale presence key from a previous session.
+        ChatServer.set_user_offline(username)
 
-            username = login_user
-            send_framed_msg(client_socket, "SUCCESS", 'A')
-            break
-                      
-        elif msg.startswith("REG:"):
-            _, reg_user, reg_pwd = msg.split(":", 2)
+        # Client sends PORT: (TCP media port) then CALL_PORT: (UDP call port) after auth
+        _, port_msg = receive_framed_msg(client_socket)
+        if not port_msg or not port_msg.startswith("PORT:"):
+            print(f"[AUTH ERROR] Expected PORT: from {addr}, got: {port_msg!r}")
+            return None
+        
+        tcp_media_port = int(port_msg.split(":")[1])
 
-            if user_exists(reg_user):
-                send_framed_msg(client_socket, "USER_EXISTS", 'A')
-                continue
+        _, call_port_msg = receive_framed_msg(client_socket)
+        if not call_port_msg or not call_port_msg.startswith("CALL_PORT:"):
+            print(f"[AUTH ERROR] Expected CALL_PORT: from {addr}, got: {call_port_msg!r}")
+            return None
+        udp_call_port = int(call_port_msg.split(":")[1])
 
-            ok, reason = validate_password(reg_pwd)
-            if not ok:
-                send_framed_msg(client_socket, f"WEAK_PASSWORD: {reason}", 'A')
-                continue
+        # Register with the global ChatServer logic using both ports.
+        ChatServer.register_client(username, client_socket, addr[0], tcp_media_port, udp_call_port)
+        ChatServer.set_user_online(username, addr[0], tcp_media_port, udp_call_port)
 
-            register_user(reg_user, reg_pwd)
-            print(f"[REGISTERED USER] {reg_user}")
+        print(f"[REGISTERED] {username} at {addr[0]} | TCP Media : {tcp_media_port} | UDP Call : {udp_call_port}")
+        
+        # Immediately flush any offline messages waiting for them
+        flush_redis_queue(client_socket, username)
 
-            username = reg_user
-            send_framed_msg(client_socket, "SUCCESS", 'A')
-            break
-
-    # Force-clear any stale presence key from a previous session.
-    ChatServer.set_user_offline(username)
-
-    # Client sends PORT: (TCP media port) then CALL_PORT: (UDP call port) after auth
-    _, port_msg = receive_framed_msg(client_socket)
-    tcp_media_port = int(port_msg.split(":")[1])
-
-    _, call_port_msg = receive_framed_msg(client_socket)
-    udp_call_port = int(call_port_msg.split(":")[1])
-
-    # Register with the global ChatServer logic using both ports.
-    ChatServer.register_client(username, client_socket, addr[0], tcp_media_port, udp_call_port)
-    ChatServer.set_user_online(username, addr[0], tcp_media_port, udp_call_port)
-
-    print(f"[REGISTERED] {username} at {addr[0]} | TCP Media : {tcp_media_port} | UDP Call : {udp_call_port}")
+        return username
     
-    # Immediately flush any offline messages waiting for them
-    flush_redis_queue(client_socket, username)
-
-    return username
+    except Exception as e:
+        print(f"[AUTH ERROR] {addr}: {e}")
+        try:
+            send_framed_msg(client_socket, f"ERROR: Authentication failed: Please reconnect.", 'A')
+        except Exception:
+            pass
+        return None
 
 def handle_client(client_socket: socket.socket, addr) -> None:
     """
@@ -376,12 +399,22 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
     Returns:
         - None
     """
+    client_socket.settimeout(INACTIVITY_TIMEOUT) # 20 minute inactivity timeout
+    
     while True:
-        _, full_message = receive_framed_msg(client_socket)
-        if not full_message: break
-
-        # Refresh the sender's redis presence TTL on every message to keep them marked as online.
-        ChatServer.refresh_presence(username)
+        try:
+            _, full_message = receive_framed_msg(client_socket)
+        except socket.timeout:
+            # No activity for 20 minutes - warn the client then drop the connection.
+            try:
+                send_framed_msg(client_socket, "TIMEOUT: No activity for 20 minutes. Please reconnect.", 'C')
+            except Exception:
+                pass
+            print(f"[TIMEOUT] {username} has been disconnected after {INACTIVITY_TIMEOUT // 60} minutes of inactivity.")
+            break
+        
+        if not full_message: 
+            break
 
         print(f"[RECEIVED] {full_message} from {username}")
         parts = full_message.split(":", 2)
@@ -506,9 +539,10 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 send_framed_msg(client_socket, "GROUP NOT FOUND OR NOT MEMBER", 'C')
 
         elif command == "GET_PEER":
-            peer = ChatServer.get_user_presence(recipient)
-            filename = data if data else "a file" # Extract the filename from the new client format
+            filename = data if data else "a file" 
 
+            peer = ChatServer.get_user_presence(recipient)
+            
             if peer:
                 ip, tcp_media_port, _ = peer
                 print(f"[FILE TRANSFER] {username} -> {recipient} | '{filename}' | routed to {ip}:{tcp_media_port}")

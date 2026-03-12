@@ -569,7 +569,7 @@ def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, Non
     msg_type = header[0:1].decode('ascii')
     msg_len = int(header[1:5].decode('ascii'))
     
-    data = b""
+    data = b''
     while len(data) < msg_len:
         packet = sock.recv(msg_len - len(data))
 
@@ -661,14 +661,21 @@ def receive_tcp_messages(sock: socket.socket, my_udp_socket: socket.socket) -> N
             # ----- Call Signalling: callee accepted our call ---------
             if msg_type == 'C' and msg.startswith("CALL_ACCEPTED:"):
                 callee = msg.split(":")[1]
-                print(f"\n[CALL] {callee} accepted your call! Waiting for connection...")
+                print(f"\n[CALL] {callee} accepted your call! Streaming started.")
                 continue
 
             # ----- Call Signalling: callee rejected our call ---------
             if msg_type == 'C' and msg.startswith("CALL_REJECTED:"):
                 callee = msg.split(":")[1]
-                print(f"\n[CALL] {callee} rejected your call.")
+                print(f"\n[CALL] {callee} declined your call.")
                 continue
+
+            # ----------- Session timeout: server is closing the connection -------------
+            if msg_type == 'C' and msg.startswith("TIMEOUT"):
+                reason = msg.split(":", 1)[1]
+                print(f"\n[SYSTEM] {reason}")
+                print("[SYSTEM] You have been disconnected. Please restart the client to reconnect.")
+                break
 
             # ------------ All Other Server Messages ----------
             print(f"\n{msg}")
@@ -726,6 +733,10 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
                             send_framed_msg(tcp_sock, f"REG:{new_user}:{new_pwd}", 'A')
                             _, reg_resp = receive_framed_msg(tcp_sock)
                             
+                            if reg_resp is None:
+                                print("[ERROR] Lost connection to server durring registration.")
+                                return None
+
                             if reg_resp == "SUCCESS":
                                 print("\n[SYSTEM] Registration successful! Welcome to the Chat.")
                                 return new_user
@@ -734,6 +745,11 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
                                 reason = reg_resp.split(":", 1)[1]
                                 print(f"[ERROR] {reason}")
                                 print(f"[INFO] Requirements: 8+ chars, uppercase, lowercase, digit, special character (e.g. !@#$..)")
+                            
+                            elif reg_resp == "USER_EXISTS":
+                                print(f"[ERROR] Username '{new_user}' was just taken. Please choose another.")
+                                break
+                            
                             else:
                                 print(f"[ERROR] Registration failed: {reg_resp}")
                                 break

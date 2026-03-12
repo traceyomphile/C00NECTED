@@ -28,8 +28,6 @@ import socket
 from datetime import datetime
 from infrastructure import redis_client, db_lock, get_db
 
-PRESENCE_TTL = 120
-
 # Thread-safe registry for ACTIVE socket connections only
 clients = {}
 clients_lock: Lock = Lock()
@@ -62,13 +60,7 @@ def set_user_online(username: str, ip: str, tcp_media_port: int, udp_call_port: 
     key = f"presence:{username}"
     value = f"{ip}:{tcp_media_port}:{udp_call_port}"
 
-    redis_client.set(key, value, ex=PRESENCE_TTL)
-
-def refresh_presence(username: str):
-    key = f"presence:{username}"
-
-    if redis_client.exists(key):
-        redis_client.expire(key, PRESENCE_TTL)
+    redis_client.set(key, value)
 
 def set_user_offline(username: str):
     redis_client.delete(f"presence:{username}")
@@ -93,7 +85,8 @@ def get_user_presence(username: str) -> tuple[str, int, int] | None:
     if len(parts) != 3:
         return None
     
-    return parts[0], int(parts[1]), int(parts[2])
+    ip, tcp_media_port, udp_call_port = parts
+    return ip, int(tcp_media_port), int(udp_call_port)
 
 def get_group_presence(group_id: str, exclude_user: str) -> tuple[list, list]:
     """
