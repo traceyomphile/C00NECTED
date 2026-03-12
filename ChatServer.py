@@ -28,8 +28,6 @@ import socket
 from datetime import datetime
 from infrastructure import redis_client, db_lock, get_db
 
-PRESENCE_TTL = 120
-
 # Thread-safe registry for ACTIVE socket connections only
 clients = {}
 clients_lock: Lock = Lock()
@@ -62,13 +60,7 @@ def set_user_online(username: str, ip: str, tcp_media_port: int, udp_call_port: 
     key = f"presence:{username}"
     value = f"{ip}:{tcp_media_port}:{udp_call_port}"
 
-    redis_client.set(key, value, ex=PRESENCE_TTL)
-
-def refresh_presence(username: str):
-    key = f"presence:{username}"
-
-    if redis_client.exists(key):
-        redis_client.expire(key, PRESENCE_TTL)
+    redis_client.set(key, value)
 
 def set_user_offline(username: str):
     redis_client.delete(f"presence:{username}")
@@ -93,7 +85,8 @@ def get_user_presence(username: str) -> tuple[str, int, int] | None:
     if len(parts) != 3:
         return None
     
-    return parts[0], int(parts[1]), int(parts[2])
+    ip, tcp_media_port, udp_call_port = parts
+    return ip, int(tcp_media_port), int(udp_call_port)
 
 def get_group_presence(group_id: str, exclude_user: str) -> tuple[list, list]:
     """
@@ -215,8 +208,8 @@ def remove_client(username: str):
     with clients_lock:
         if username in clients:
             del clients[username]
-        update_last_seen(username)
-        set_user_offline(username)
+    update_last_seen(username)
+    set_user_offline(username)
 
 # ---------------
 # GETTING PEERS
@@ -301,19 +294,18 @@ def create_group(group_id: str, creator: str) -> bool:
             if cur.fetchone():
                 return False
             
-            with db_lock:
-                cur.execute(
-                    "INSERT INTO groups(group_id) VALUES(?)",
-                    (group_id,)
-                )
+            cur.execute(
+                "INSERT INTO groups(group_id) VALUES(?)",
+                (group_id,)
+            )
 
-                cur.execute(
-                    "INSERT INTO group_members(group_id, username) VALUES(?,?)",
-                    (group_id, creator)
-                )
+            cur.execute(
+                "INSERT INTO group_members(group_id, username) VALUES(?,?)",
+                (group_id, creator)
+            )
 
-                conn.commit()
-                return True
+            conn.commit()
+            return True
         finally:
             conn.close()
     
@@ -385,6 +377,7 @@ def leave_group(group_id: str, username: str) -> bool:
                 "DELETE FROM group_members WHERE group_id=? AND username=?",
                 (group_id, username)
             )
+            affected = cur.rowcount
 
             cur.execute(
                 "SELECT COUNT(*) FROM group_members WHERE group_id=?",
@@ -401,7 +394,7 @@ def leave_group(group_id: str, username: str) -> bool:
 
             conn.commit()
 
-        return True
+        return affected > 0
     finally:
         conn.close()
 
@@ -497,6 +490,6 @@ def get_call_peer(username: str):
     if not presence:
         return None
     
-    ip, _, _, udp_call_port = presence
+    ip, _, udp_call_port = presence
 
     return ip, udp_call_port

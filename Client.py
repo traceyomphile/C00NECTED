@@ -35,6 +35,7 @@ Date: 2026-03-11
 import socket
 import threading
 import os
+import base64
 import struct
 import pyaudio
 import cv2
@@ -46,6 +47,11 @@ import pickle
 
 SERVER_IP = socket.gethostbyname(socket.gethostname())
 TCP_PORT = 50000
+
+# --------------------------------------
+# GRACEFUL SHUTDOWN FLAG
+# --------------------------------------
+shutting_down = False
 
 # Maximum allowed video length for outgoing transfers (seconds)
 MAX_VIDEO_SECONDS = 45
@@ -291,6 +297,35 @@ def send_file_tcp(filepath: str, target_ip: str, target_port: int) -> None:
 
     finally:
         sock.close()
+
+def upload_file_for_offline(sock: socket.socket, recipient: str, filepath: str) -> None:
+    """
+    Base64-encodes a local file and sends it to the server via UPLOAD_MEDIA so it can be stored
+    in SQLite and delivered to an offline recipient on their next login.
+
+    Parameters:
+        - sock : The TCP control socket connected to the server.
+        - recipient : Username or group_id the file is destined for.
+        - filepath : Local path of the file to upload.
+
+    Returns:
+        - None
+    """
+    try:
+        filename = os.path.basename(filepath)
+        filetype = get_file_type(filepath)
+
+        with open(filepath, 'rb') as f:
+            b64_data = base64.b64encode(f.read()).decode('ascii')
+        
+        send_framed_msg(sock, f"UPLOAD_MEDIA:{recipient}:{filename}|{filetype}|{b64_data}", 'D')
+    
+    except Exception as e:
+        print(f"[ERROR] Failed to store file for offline delivery: {e}")
+
+    finally:
+        # Clean up pending entry regardless of outcome
+        pending_transfers.pop(recipient, None)
 
 # ------------------------------------------------------------------------------
 # UDP CALL STREAMING
@@ -562,14 +597,14 @@ def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, Non
     Returns:
         - tuple[str, str] | tuple[None, None] -> Representing msg_type, content on normal behaviour.
     """
-    header = sock.recv(5)
-    if not header or len(header) < 5: 
+    header = sock.recv(9)
+    if not header or len(header) < 9: 
         return None, None
     
     msg_type = header[0:1].decode('ascii')
-    msg_len = int(header[1:5].decode('ascii'))
+    msg_len = int(header[1:9].decode('ascii'))
     
-    data = b""
+    data = b''
     while len(data) < msg_len:
         packet = sock.recv(msg_len - len(data))
 
@@ -661,20 +696,80 @@ def receive_tcp_messages(sock: socket.socket, my_udp_socket: socket.socket) -> N
             # ----- Call Signalling: callee accepted our call ---------
             if msg_type == 'C' and msg.startswith("CALL_ACCEPTED:"):
                 callee = msg.split(":")[1]
-                print(f"\n[CALL] {callee} accepted your call! Waiting for connection...")
+                print(f"\n[CALL] {callee} accepted your call! Streaming started.")
                 continue
 
             # ----- Call Signalling: callee rejected our call ---------
             if msg_type == 'C' and msg.startswith("CALL_REJECTED:"):
                 callee = msg.split(":")[1]
-                print(f"\n[CALL] {callee} rejected your call.")
+                print(f"\n[CALL] {callee} declined your call.")
+                continue
+
+            # ----------- Session timeout: server is closing the connection -------------
+            if msg_type == 'C' and msg.startswith("TIMEOUT"):
+                reason = msg.split(":", 1)[1]
+                print(f"\n[SYSTEM] {reason}")
+                print("[SYSTEM] You have been disconnected. Please restart the client to reconnect.")
+                break
+
+            # ------------------- Offline Users -----------------
+            if msg_type == 'C' and msg.startswith("USER_OFFLINE:"):
+                parts = msg.split(":", 2)
+                
+                offline_user = parts[1]
+                last_seen = parts[2] if len(parts) > 2 else "unknown"
+                pending_transfers.pop(offline_user, None)
+
+            # ------------ Offline File Storage ----------------
+            if msg_type == 'C' and msg.startswith("STORE_OFFLINE:"):
+                offline_target = msg.split(":", 1)[1]
+
+                filepath = pending_transfers.get(offline_target)
+                if filepath:
+                    print(f"\n[SYSTEM] '{offline_target}' is offline. Uploading file for delivery...")
+                    threading.Thread(
+                        target=upload_file_for_offline,
+                        args=(sock, offline_target, filepath),
+                        daemon=True
+                    ).start()
+                continue
+
+            # ------------- Offline File Notification --------------
+            if msg.startswith("MEDIA_WAITING:"):
+                parts = msg.split(":", 3)
+                media_id, sender, filename = parts[1], parts[2], parts[3]
+
+                print(f"\n[OFFLINE FILE] '{sender}' sent you '{filename}' while you were offline. Downloading...")
+                send_framed_msg(sock, f"DOWNLOAD_MEDIA:{media_id}:", 'C')
+                continue
+
+            # ------------- Offline File Download ------------------
+            if msg_type == 'D' and msg.startswith("FILE:"):
+                parts = msg.split(":", 3)
+
+                if len(parts) == 4:
+                    _, filename, filetype, b64_data = parts
+
+                    os.makedirs("received", exist_ok=True)
+                    save_path = os.path.join("received", filename)
+                    base_p, ext = os.path.splitext(save_path)
+
+                    counter = 1
+                    while os.path.exists(save_path):
+                        save_path = f"{base_p}_{counter}{ext}"
+                        counter += 1
+                    
+                    with open(save_path, 'wb') as f:
+                        f.write(base64.b64decode(b64_data))
+                    print(f"\n[OFFLINE LINE] Saved '{filename}' ({filetype}) -> {save_path}")
                 continue
 
             # ------------ All Other Server Messages ----------
             print(f"\n{msg}")
 
         except Exception as e:
-            print(f"\n[ERROR] Connection lost: {e}")
+            if not shutting_down:
+                print(f"\n[ERROR] Connection lost: {e}")
             break
 
 
@@ -707,6 +802,11 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
                 if auth_resp == "SUCCESS":
                     print("\n[SYSTEM] Login successful! Welcome to the Chat.")
                     return username
+                
+                elif auth_resp == "ALREADY ONLINE":
+                    print(f"[ERROR] This account is already logged in elsewhere.")
+                    return None
+                
                 else:
                     print("[ERROR] Incorrect password. Try again.")
                     
@@ -721,21 +821,31 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
                     if check_resp == "EXISTS":
                         print("[ERROR] Username already taken. Try another.")
                     else:
-                        new_pwd = input("Enter new password: ").strip()
-                        send_framed_msg(tcp_sock, f"REG:{new_user}:{new_pwd}", 'A')
-                        _, reg_resp = receive_framed_msg(tcp_sock)
-                        
-                        if reg_resp == "SUCCESS":
-                            print("\n[SYSTEM] Registration successful! Welcome to the Chat.")
-                            return 
-                        
-                        elif reg_resp.startswith("WEAK_PASSWORD:"):
-                            reason = reg_resp.split(":", 1)[1]
-                            print(f"[ERROR] {reason}")
-                            print(f"[INFO] Requirements: 8+ chars, uppercase, lowercase, digit, special character (e.g. !@#$..)")
-                        else:
-                            print(f"[ERROR] Registration failed: {reg_resp}")
-                            break
+                        while True:
+                            new_pwd = input("Enter new password: ").strip()
+                            send_framed_msg(tcp_sock, f"REG:{new_user}:{new_pwd}", 'A')
+                            _, reg_resp = receive_framed_msg(tcp_sock)
+                            
+                            if reg_resp is None:
+                                print("[ERROR] Lost connection to server durring registration.")
+                                return None
+
+                            if reg_resp == "SUCCESS":
+                                print("\n[SYSTEM] Registration successful! Welcome to the Chat.")
+                                return new_user
+                            
+                            elif reg_resp.startswith("WEAK_PASSWORD:"):
+                                reason = reg_resp.split(":", 1)[1]
+                                print(f"[ERROR] {reason}")
+                                print(f"[INFO] Requirements: 8+ chars, uppercase, lowercase, digit, special character (e.g. !@#$..)")
+                            
+                            elif reg_resp == "USER_EXISTS":
+                                print(f"[ERROR] Username '{new_user}' was just taken. Please choose another.")
+                                break
+
+                            else:
+                                print(f"[ERROR] Registration failed: {reg_resp}")
+                                break
             else:
                 return None # Exits program if they decline registration
 
@@ -820,6 +930,9 @@ def start_client() -> None:
     threading.Thread(target=receive_tcp_messages, args=(tcp_sock, udp_sock), daemon=True).start()
     threading.Thread(target=listen_for_call_udp, args=(udp_sock,), daemon=True).start()
 
+    # 6b. Ask the server to flush any message/files queued while we were offline.
+    send_framed_msg(tcp_sock, "FLUSH_OFFLINE:", 'C')
+
     # 7. Main command loop
     while True:
         try:
@@ -831,6 +944,9 @@ def start_client() -> None:
             continue
 
         if msg.upper() == "EXIT":
+            global shutting_down
+            shutting_down = True
+            send_framed_msg(tcp_sock, "EXIT:", 'C')
             break
 
         if msg.upper() == "COMMANDS":
@@ -931,9 +1047,25 @@ def start_client() -> None:
         
         else:
             print("[ERROR] Unknown command. Type COMMANDS for help.")
-    # Shutdown
+    
+    # Shutdown: Signal the background receive thread to stop by shutting down the TCP socket before closing it.
+    try:
+        tcp_sock.shutdown(socket.SHUT_RDWR)
+    except:
+        pass
+
     tcp_sock.close()
-    udp_sock.close()
+
+    try:
+        media_sock.close()
+    except Exception:
+        pass
+
+    try:
+        udp_sock.close()
+    except Exception:
+        pass
+
     print("[SYSTEM] Disconnected.")
 
 if __name__ == "__main__":
