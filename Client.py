@@ -48,6 +48,11 @@ import pickle
 SERVER_IP = socket.gethostbyname(socket.gethostname())
 TCP_PORT = 50000
 
+# --------------------------------------
+# GRACEFUL SHUTDOWN FLAG
+# --------------------------------------
+shutting_down = False
+
 # Maximum allowed video length for outgoing transfers (seconds)
 MAX_VIDEO_SECONDS = 45
 
@@ -592,12 +597,12 @@ def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, Non
     Returns:
         - tuple[str, str] | tuple[None, None] -> Representing msg_type, content on normal behaviour.
     """
-    header = sock.recv(5)
-    if not header or len(header) < 5: 
+    header = sock.recv(9)
+    if not header or len(header) < 9: 
         return None, None
     
     msg_type = header[0:1].decode('ascii')
-    msg_len = int(header[1:5].decode('ascii'))
+    msg_len = int(header[1:9].decode('ascii'))
     
     data = b''
     while len(data) < msg_len:
@@ -763,7 +768,8 @@ def receive_tcp_messages(sock: socket.socket, my_udp_socket: socket.socket) -> N
             print(f"\n{msg}")
 
         except Exception as e:
-            print(f"\n[ERROR] Connection lost: {e}")
+            if not shutting_down:
+                print(f"\n[ERROR] Connection lost: {e}")
             break
 
 
@@ -938,6 +944,8 @@ def start_client() -> None:
             continue
 
         if msg.upper() == "EXIT":
+            global shutting_down
+            shutting_down = True
             send_framed_msg(tcp_sock, "EXIT:", 'C')
             break
 
@@ -1057,7 +1065,7 @@ def start_client() -> None:
         udp_sock.close()
     except Exception:
         pass
-    
+
     print("[SYSTEM] Disconnected.")
 
 if __name__ == "__main__":

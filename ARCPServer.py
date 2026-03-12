@@ -160,7 +160,7 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
 def send_framed_msg(sock: socket.socket, message: str, msg_type: str = 'D') -> None:
     """
     Frames a message with a header and sends it over the socket.
-    Header Format: [Type (1 char)][Length (4 chars)]
+    Header Format: [Type (1 ASCII char)][Length (8 decimal digit ASCII)]
     Parameters:
         - sock: The socket to send the message through.
         - message: The content of the message to send.
@@ -169,7 +169,7 @@ def send_framed_msg(sock: socket.socket, message: str, msg_type: str = 'D') -> N
         - None
     """
     data = message.encode('ascii')
-    header = f"{msg_type}{len(data):04d}".encode('ascii')
+    header = f"{msg_type}{len(data):08d}".encode('ascii')
     sock.sendall(header + data)
 
 def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, None]:
@@ -182,13 +182,13 @@ def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, Non
         - msg_type: The type of the message (e.g., 'D', 'C', 'A').
         - message: The content of the message as a string.
     """
-    header = sock.recv(5)
+    header = sock.recv(9)
 
     if not header or len(header) < 5: 
         return None, None
 
     msg_type = header[0:1].decode('ascii')
-    msg_len = int(header[1:5].decode('ascii'))
+    msg_len = int(header[1:9].decode('ascii'))
     
     data = b''
 
@@ -644,7 +644,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         # --------- FLUSH OFFLINE QUEUE --------------
         elif command == "FLUSH_OFFLINE":
             flush_redis_queue(client_socket, username)
-            
+
         elif command == "EXIT":
             print(f"[EXIT] {username} disconnected gracefully.")
             break
