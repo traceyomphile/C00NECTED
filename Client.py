@@ -35,6 +35,7 @@ Date: 2026-03-11
 import socket
 import threading
 import os
+import base64
 import struct
 import pyaudio
 import cv2
@@ -291,6 +292,35 @@ def send_file_tcp(filepath: str, target_ip: str, target_port: int) -> None:
 
     finally:
         sock.close()
+
+def upload_file_for_offline(sock: socket.socket, recipient: str, filepath: str) -> None:
+    """
+    Base64-encodes a local file and sends it to the server via UPLOAD_MEDIA so it can be stored
+    in SQLite and delivered to an offline recipient on their next login.
+
+    Parameters:
+        - sock : The TCP control socket connected to the server.
+        - recipient : Username or group_id the file is destined for.
+        - filepath : Local path of the file to upload.
+
+    Returns:
+        - None
+    """
+    try:
+        filename = os.path.basename(filepath)
+        filetype = get_file_type(filepath)
+
+        with open(filepath, 'rb') as f:
+            b64_data = base64.b64encode(f.read()).decode('ascii')
+        
+        send_framed_msg(sock, f"UPLOAD_MEDIA:{recipient}:{filename}|{filetype}|{b64_data}", 'D')
+    
+    except Exception as e:
+        print(f"[ERROR] Failed to store file for offline delivery: {e}")
+
+    finally:
+        # Clean up pending entry regardless of outcome
+        pending_transfers.pop(recipient, None)
 
 # ------------------------------------------------------------------------------
 # UDP CALL STREAMING
@@ -677,6 +707,58 @@ def receive_tcp_messages(sock: socket.socket, my_udp_socket: socket.socket) -> N
                 print("[SYSTEM] You have been disconnected. Please restart the client to reconnect.")
                 break
 
+            # ------------------- Offline Users -----------------
+            if msg_type == 'C' and msg.startswith("USER_OFFLINE:"):
+                parts = msg.split(":", 2)
+                
+                offline_user = parts[1]
+                last_seen = parts[2] if len(parts) > 2 else "unknown"
+                pending_transfers.pop(offline_user, None)
+
+            # ------------ Offline File Storage ----------------
+            if msg_type == 'C' and msg.startswith("STORE_OFFLINE:"):
+                offline_target = msg.split(":", 1)[1]
+
+                filepath = pending_transfers.get(offline_target)
+                if filepath:
+                    print(f"\n[SYSTEM] '{offline_target}' is offline. Uploading file for delivery...")
+                    threading.Thread(
+                        target=upload_file_for_offline,
+                        args=(sock, offline_target, filepath),
+                        daemon=True
+                    ).start()
+                continue
+
+            # ------------- Offline File Notification --------------
+            if msg.startswith("MEDIA_WAITING:"):
+                parts = msg.split(":", 3)
+                media_id, sender, filename = parts[1], parts[2], parts[3]
+
+                print(f"\n[OFFLINE FILE] '{sender}' sent you '{filename}' while you were offline. Downloading...")
+                send_framed_msg(sock, f"DOWNLOAD_MEDIA:{media_id}:", 'C')
+                continue
+
+            # ------------- Offline File Download ------------------
+            if msg_type == 'D' and msg.startswith("FILE:"):
+                parts = msg.split(":", 3)
+
+                if len(parts) == 4:
+                    _, filename, filetype, b64_data = parts
+
+                    os.makedirs("received", exist_ok=True)
+                    save_path = os.path.join("received", filename)
+                    base_p, ext = os.path.splitext(save_path)
+
+                    counter = 1
+                    while os.path.exists(save_path):
+                        save_path = f"{base_p}_{counter}{ext}"
+                        counter += 1
+                    
+                    with open(save_path, 'wb') as f:
+                        f.write(base64.b64decode(b64_data))
+                    print(f"\n[OFFLINE LINE] Saved '{filename}' ({filetype}) -> {save_path}")
+                continue
+
             # ------------ All Other Server Messages ----------
             print(f"\n{msg}")
 
@@ -714,6 +796,11 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
                 if auth_resp == "SUCCESS":
                     print("\n[SYSTEM] Login successful! Welcome to the Chat.")
                     return username
+                
+                elif auth_resp == "ALREADY ONLINE":
+                    print(f"[ERROR] This account is already logged in elsewhere.")
+                    return None
+                
                 else:
                     print("[ERROR] Incorrect password. Try again.")
                     
@@ -749,7 +836,7 @@ def authenticate_console(tcp_sock: socket.socket) -> str | None:
                             elif reg_resp == "USER_EXISTS":
                                 print(f"[ERROR] Username '{new_user}' was just taken. Please choose another.")
                                 break
-                            
+
                             else:
                                 print(f"[ERROR] Registration failed: {reg_resp}")
                                 break
@@ -848,6 +935,7 @@ def start_client() -> None:
             continue
 
         if msg.upper() == "EXIT":
+            send_framed_msg(tcp_sock, "EXIT", 'C')
             break
 
         if msg.upper() == "COMMANDS":

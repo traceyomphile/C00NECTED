@@ -208,8 +208,8 @@ def remove_client(username: str):
     with clients_lock:
         if username in clients:
             del clients[username]
-        update_last_seen(username)
-        set_user_offline(username)
+    update_last_seen(username)
+    set_user_offline(username)
 
 # ---------------
 # GETTING PEERS
@@ -294,19 +294,18 @@ def create_group(group_id: str, creator: str) -> bool:
             if cur.fetchone():
                 return False
             
-            with db_lock:
-                cur.execute(
-                    "INSERT INTO groups(group_id) VALUES(?)",
-                    (group_id,)
-                )
+            cur.execute(
+                "INSERT INTO groups(group_id) VALUES(?)",
+                (group_id,)
+            )
 
-                cur.execute(
-                    "INSERT INTO group_members(group_id, username) VALUES(?,?)",
-                    (group_id, creator)
-                )
+            cur.execute(
+                "INSERT INTO group_members(group_id, username) VALUES(?,?)",
+                (group_id, creator)
+            )
 
-                conn.commit()
-                return True
+            conn.commit()
+            return True
         finally:
             conn.close()
     
@@ -378,6 +377,7 @@ def leave_group(group_id: str, username: str) -> bool:
                 "DELETE FROM group_members WHERE group_id=? AND username=?",
                 (group_id, username)
             )
+            affected = cur.rowcount
 
             cur.execute(
                 "SELECT COUNT(*) FROM group_members WHERE group_id=?",
@@ -394,7 +394,7 @@ def leave_group(group_id: str, username: str) -> bool:
 
             conn.commit()
 
-        return True
+        return affected > 0
     finally:
         conn.close()
 
@@ -490,6 +490,6 @@ def get_call_peer(username: str):
     if not presence:
         return None
     
-    ip, _, _, udp_call_port = presence
+    ip, _, udp_call_port = presence
 
     return ip, udp_call_port
