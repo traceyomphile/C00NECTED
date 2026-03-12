@@ -586,7 +586,7 @@ def send_framed_msg(sock: socket.socket, message: str, msg_type: str='D') -> Non
         - None.
     """
     data = message.encode('ascii')
-    header = f"{msg_type}{len(data):04d}".encode('ascii')
+    header = f"{msg_type}{len(data):08d}".encode('ascii')
     sock.sendall(header + data)
 
 def receive_framed_msg(sock: socket.socket) -> tuple[str, str] | tuple[None, None]:
