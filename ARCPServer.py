@@ -20,9 +20,11 @@ Integrations:
 Date: 2026-03-11
 """
 
+import select
 import socket
 import threading
 import re
+import time
 import ChatServer
 from infrastructure import redis_client, db_lock, get_db, initialise_database, hash_password, verify_password
 
@@ -158,10 +160,10 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
 
                 result = get_media(int(media_id))
                 if result:
-                    filename, filetype, b64_data = result
+                    file_sender, filename, filetype, b64_data = result
                     send_framed_msg(
                         client_socket,
-                        f"FILE:{filename}:{filetype}:{b64_data}",
+                        f"FILE:{filename}:{filetype}:{b64_data}:{file_sender}",
                         'D'
                     )
             else:
@@ -249,26 +251,24 @@ def store_media(sender: str, filename: str, filetype: str, data_b64: str, recipi
         finally:
             conn.close()
 
-def get_media(media_id: int) -> tuple[str, str, str] | None:
+def get_media(media_id: int) -> tuple | None:
     """
     Retrieves a stored media file from the SQLite media table by its ID.
-    Parameters:
-        - media_id : The unique ID of the media record to retrieve.
     Returns:
-        - A tuple containing (filename, filetype, data) if found, or None if not found.
+        - A tuple (sender, filename, filetype, data) if found, or None if not found.
     """
     conn = get_db()
     cur = conn.cursor()
 
     try:
         cur.execute(
-            "SELECT filename, filetype, data FROM media WHERE id=?",
+            "SELECT sender, filename, filetype, data FROM media WHERE id=?",
             (media_id,)
         )
         row = cur.fetchone()
         if not row:
             return None
-        return row["filename"], row["filetype"], row["data"]
+        return row["sender"], row["filename"], row["filetype"], row["data"]
 
     finally:
         conn.close()
@@ -420,11 +420,21 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
     Returns:
         - None
     """
-    client_socket.settimeout(INACTIVITY_TIMEOUT) # 20 minute inactivity timeout
+    client_socket.settimeout(None) # 20 minute inactivity timeout
+
+    # Application-level ping
+    last_activity = time.time()
     
     while True:
         try:
-            _, full_message = receive_framed_msg(client_socket)
+            if time.time() - last_activity > INACTIVITY_TIMEOUT:
+                break
+
+            ready, _, _ = select.select([client_socket], [], [], 1.0)
+
+            if ready:
+                _, full_message = receive_framed_msg(client_socket)
+                
         except socket.timeout:
             # No activity for 20 minutes - warn the client then drop the connection.
             try:
@@ -526,7 +536,7 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                                 try:
                                     send_framed_msg(
                                         recipient_sock[0],
-                                        f"FILE:{filename}:{filetype}:{b64_data}",
+                                        f"FILE:{filename}:{filetype}:{b64_data}:{username}",
                                         'D'
                                     )
                                 except Exception:
@@ -560,9 +570,9 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                     print(f"[MEDIA DOWNLOAD] {username} requested ID {media_id} | NOT FOUND")
                     send_framed_msg(client_socket, "ERROR: Media not found.", 'C')
                 else:
-                    filename, filetype, b64_data = result
-                    print(f"[MEDIA DOWNLOAD] {username} requested ID {media_id} | {filetype} '{filetype}'")
-                    send_framed_msg(client_socket, f"FILE:{filename}:{filetype}:{b64_data}", 'D')
+                    file_sender, filename, filetype, b64_data = result
+                    print(f"[MEDIA DOWNLOAD] {username} requested ID {media_id} | {filetype} '{filename}'")
+                    send_framed_msg(client_socket, f"FILE:{filename}:{filetype}:{b64_data}:{file_sender}", 'D')
 
             except ValueError:
                 send_framed_msg(client_socket, "ERROR: Invalid media ID.", 'C')
@@ -650,12 +660,13 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             send_framed_msg(client_socket, f"CALL_PEER_INFO:{recipient}:{ip}:{udp_call_port}", 'C')
 
             # Also notify the recipient that an incoming call is coming,
-            # so they can prompt the user to accept or reject
+            # include the caller's IP and UDP port so the callee can set
+            # incoming_caller_addr immediately (without waiting for a UDP packet).
             with ChatServer.clients_lock:
                 recipient_sock = ChatServer.clients.get(recipient)
             if recipient_sock:
                 try:
-                    send_framed_msg(recipient_sock[0], f"{call_type}:{username}", 'C')
+                    send_framed_msg(recipient_sock[0], f"{call_type}:{username}:{ip}:{udp_call_port}", 'C')
                 except Exception:
                     pass
 

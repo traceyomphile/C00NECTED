@@ -40,12 +40,22 @@ import struct
 import pyaudio
 import cv2
 import pickle
+import sys
 
 # ----------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------
 
 SERVER_IP = socket.gethostbyname(socket.gethostname())
+
+"""
+if len(sys.argv) > 1:
+    SERVER_IP = sys.argv[1]
+else:
+    SERVER_IP = socket.gethostbyname(socket.gethostname()) #'127.0.0.1'
+    print(f"[INFO] No SERVER IP provided. Defaulting to {SERVER_IP}")
+    print(f"[INFO] To connect to a remote server, use: python Client.py <SERVER_IP>")
+"""
 TCP_PORT = 50000
 
 # --------------------------------------
@@ -414,7 +424,7 @@ def receive_audio(udp_sock: socket.socket) -> None:
     )
 
     # Set timeout so recvfrom doesn't block forever
-    udp_sock.settimeout(0.5)
+    udp_sock.settimeout(5.0)
 
     try:
         while not call_ended:
@@ -696,7 +706,7 @@ def receive_tcp_messages(sock: socket.socket, my_udp_socket: socket.socket) -> N
 
             # ------- Call Signalling: Incoming Call Notification -----------
             if msg.startswith("AUDIO_CALL:") or msg.startswith("VIDEO_CALL:"):
-                global pending_caller  #I was here
+                global pending_caller
                 
                 caller = msg.split(":")[1]
                 pending_caller = caller
@@ -712,7 +722,6 @@ def receive_tcp_messages(sock: socket.socket, my_udp_socket: socket.socket) -> N
                 peer_user = parts[1]
                 peer_ip = parts[2]
                 peer_udp_port = int(parts[3])
-                call_type = parts[4]
 
                 print(f"\n[CALL] Ringing {peer_user}")
 
@@ -727,8 +736,6 @@ def receive_tcp_messages(sock: socket.socket, my_udp_socket: socket.socket) -> N
             if msg_type == 'C' and msg.startswith("CALL_ACCEPTED:"):
                 callee = msg.split(":")[1]
                 print(f"\n[CALL] {callee} accepted your call!")
-
-                send_framed_msg(sock, f"GET_CALL_PEER:{callee}", 'C')
                 continue
 
             # ----- Call Signalling: callee rejected our call ---------
