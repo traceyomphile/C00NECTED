@@ -74,8 +74,6 @@ C_BORDER    = "#1E3A5F"
 C_RED       = "#EF4444"   
 C_AMBER     = "#F59E0B"   
 C_ONLINE    = "#22C55E"   
-C_TICK_GREY = "#7B8FA6"   
-C_TICK_BLUE = "#60A5FA"   
 
 FONT_APP    = ("Segoe UI", 10)
 FONT_BOLD   = ("Segoe UI", 10, "bold")
@@ -1294,7 +1292,6 @@ class ChatWindow:
         self._verifying_group:    str | None    = None  
 
         self.unread_counts: dict[str, int]  = {}
-        self._tick_labels: dict[str, tk.Label] = {}
         self._voice_rec   = VoiceRecorder()
         self._is_recording = False
 
@@ -1557,23 +1554,17 @@ class ChatWindow:
             self.unread_counts[self.current_chat] = 0
             self._update_chat_list()
 
-        last_out_idx = None
         for i, m in enumerate(msgs):
-            if m.get('outgoing', False):
-                last_out_idx = i
-
-        for i, m in enumerate(msgs):
-            self._render_bubble(m, register_tick=(i == last_out_idx))
+            self._render_bubble(m)
 
         self._scroll_to_bottom()
 
-    def _render_bubble(self, msg: dict, register_tick: bool = False):
+    def _render_bubble(self, msg: dict):
         msg_type = msg.get('type', '')
         content  = msg.get('content', '')
         sender   = msg.get('sender', '')
         ts       = msg.get('timestamp', '')
         outgoing = msg.get('outgoing', False)
-        status   = msg.get('status', 'pending')   
         unread   = msg.get('unread', False)
 
         is_notification = (
@@ -1700,13 +1691,6 @@ class ChatWindow:
             time_str = ts.split(' ')[1] if ' ' in ts else ts
             tk.Label(meta, text=time_str, font=FONT_MICRO,
                      fg=C_SECONDARY, bg=bg).pack(side='left')
-            if outgoing:
-                tick_txt, tick_col = self._tick_appearance(status)
-                tick_lbl = tk.Label(meta, text=tick_txt,
-                                    font=("Segoe UI", 9), fg=tick_col, bg=bg)
-                tick_lbl.pack(side='left', padx=(4, 0))
-                if register_tick:
-                    self._tick_labels[self.current_chat] = tick_lbl
 
             self.msg_canvas.update_idletasks()
             self._scroll_to_bottom()
@@ -1743,44 +1727,11 @@ class ChatWindow:
         tk.Label(meta, text=time_str, font=FONT_MICRO, fg=C_SECONDARY, bg=bg
                  ).pack(side='left')
 
-        if outgoing:
-            tick_txt, tick_col = self._tick_appearance(status)
-            tick_lbl = tk.Label(
-                meta, text=tick_txt, font=("Segoe UI", 9),
-                fg=tick_col, bg=bg
-            )
-            tick_lbl.pack(side='left', padx=(4, 0))
-            if register_tick:
-                self._tick_labels[self.current_chat] = tick_lbl
-
         self.msg_canvas.update_idletasks()
         self._scroll_to_bottom()
 
-    @staticmethod
-    def _tick_appearance(status: str) -> tuple:
-        if status == 'read':
-            return '✓✓', C_TICK_BLUE
-        if status == 'delivered':
-            return '✓✓', C_TICK_GREY
-        return '✓', C_TICK_GREY
-
     def _scroll_to_bottom(self):
         self.msg_canvas.yview_moveto(1.0)
-
-    def _update_last_tick(self, chat_id: str, new_status: str):
-        msgs = self.conversations.get(chat_id, [])
-        for m in reversed(msgs):
-            if m.get('outgoing', False):
-                m['status'] = new_status
-                self.history._data.get('conversations', {}).get(chat_id, [])
-                self.history._save_nolock()
-                break
-
-        if chat_id == self.current_chat and chat_id in self._tick_labels:
-            lbl = self._tick_labels.get(chat_id)
-            if lbl and lbl.winfo_exists():
-                txt, col = self._tick_appearance(new_status)
-                lbl.config(text=txt, fg=col)
 
     def _append_message(self, chat_id: str, msg_dict: dict):
         if chat_id not in self.conversations:
@@ -1797,8 +1748,7 @@ class ChatWindow:
             self.unread_counts[chat_id] = self.unread_counts.get(chat_id, 0) + 1
             self._update_chat_list()
         elif is_active and hasattr(self, 'msg_inner'):
-            is_last_out = msg_dict.get('outgoing', False)
-            self._render_bubble(msg_dict, register_tick=is_last_out)
+            self._render_bubble(msg_dict)
             self._update_chat_list()
         else:
             self._update_chat_list()
@@ -1934,7 +1884,6 @@ class ChatWindow:
             'content': text,
             'timestamp': ts,
             'outgoing': True,
-            'status': 'pending',
         })
         self.input_var.set('')
 
@@ -1987,7 +1936,6 @@ class ChatWindow:
             'content':   f'🎤 Voice note  {duration}s',
             'timestamp': ts,
             'outgoing':  True,
-            'status':    'pending',
             'voice_path': path,
             'voice_dur':  duration,
         }
@@ -2210,7 +2158,6 @@ class ChatWindow:
                 parsed['unread'] = (sender != self.username and
                                     self.current_chat != sender)
                 self._append_message(sender, {**parsed, 'outgoing': False})
-                self._update_last_tick(sender, 'read')
 
             elif parsed['type'] == 'group':
                 group = parsed['group']
@@ -2219,7 +2166,6 @@ class ChatWindow:
                     return
                 parsed['unread'] = (self.current_chat != group)
                 self._append_message(group, {**parsed, 'outgoing': False})
-                self._update_last_tick(group, 'read')
 
             else:
                 content = parsed.get('content', raw_msg)
@@ -2299,7 +2245,6 @@ class ChatWindow:
                 'content':  f"📎 Sent file: {filename}",
                 'timestamp': ts,
                 'outgoing': True,
-                'status': 'pending'
             }
             self._append_message(self.username, note)
 
