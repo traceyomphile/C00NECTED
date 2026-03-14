@@ -74,6 +74,8 @@ C_BORDER    = "#1E3A5F"
 C_RED       = "#EF4444"   
 C_AMBER     = "#F59E0B"   
 C_ONLINE    = "#22C55E"   
+C_TICK_GREY = "#7B8FA6"   
+C_TICK_BLUE = "#60A5FA"   
 
 FONT_APP    = ("Segoe UI", 10)
 FONT_BOLD   = ("Segoe UI", 10, "bold")
@@ -354,13 +356,11 @@ class CallManager:
                     if not self._video_queue.full():
                         self._video_queue.put_nowait(datagram)
                 elif pkt_type == PKT_END:
-                    # FIX 1: Safely accept the end sequence and push to GUI
                     if not self.call_ended:
                         self.call_ended = True
                         self.gui_queue.put(("CALL_ENDED_REMOTE",))
 
     def start_symmetric_call(self, peer_ip: str, peer_udp_port: int, call_type: str = 'audio'):
-        """Symmetric setup for both Caller and Callee initiated by the server."""
         if not self.call_ended: return 
         
         self._begin_call(call_type)
@@ -397,7 +397,6 @@ class CallManager:
         self.call_type  = call_type
 
     def end_call(self):
-        # FIX 1: Only send PKT_END if we were active! This prevents the "Echo" bug.
         was_active = not self.call_ended
         self.call_ended = True
         
@@ -619,21 +618,27 @@ class NetworkClient:
                         ).start()
                     continue
 
-                # FIX 2: Safely parse CALL_PEER_INFO regardless of whether it's 4 or 5 parts!
-                if msg_type == 'C' and msg.startswith("CALL_PEER_INFO:"):
+                # THE FIX: Tell Caller that the Callee answered, and start the media streams!
+                if msg_type == 'C' and msg.startswith("CALL_ACCEPTED:"):
                     parts = msg.split(":")
-                    peer_user = parts[1]
-                    peer_ip = parts[2]
-                    peer_udp_port = parts[3]
+                    callee = parts[1]
+                    if len(parts) >= 4:
+                        callee_ip = parts[2]
+                        callee_port = int(parts[3])
+                        self.call_manager.start_symmetric_call(callee_ip, callee_port, self.current_call_type)
                     
-                    self.call_manager.start_symmetric_call(peer_ip, int(peer_udp_port), self.current_call_type)
-                    self.gui_queue.put(('CALL_CONNECTED', peer_user))
+                    self.gui_queue.put(('CALL_CONNECTED', callee))
                     continue
 
                 if msg_type == 'C' and msg.startswith("CALL_REJECTED:"):
                     callee = msg.split(":")[1]
                     self.call_manager.end_call()
                     self.gui_queue.put(('CALL_REJECTED', callee))
+                    continue
+
+                # THE FIX: Tell the GUI to update the popup to show that it is ringing!
+                if msg_type == 'C' and msg.startswith("CALL_RINGING:"):
+                    self.gui_queue.put(('CALL_RINGING', msg.split(":")[1]))
                     continue
 
                 if msg.startswith("AUDIO_CALL:") or msg.startswith("VIDEO_CALL:"):
@@ -1292,6 +1297,7 @@ class ChatWindow:
         self._verifying_group:    str | None    = None  
 
         self.unread_counts: dict[str, int]  = {}
+        self._tick_labels: dict[str, tk.Label] = {}
         self._voice_rec   = VoiceRecorder()
         self._is_recording = False
 
@@ -1453,7 +1459,6 @@ class ChatWindow:
         btn_frame = tk.Frame(hdr, bg=C_HEADER)
         btn_frame.place(relx=1.0, rely=0.5, anchor='e', x=-12)
 
-        # FIX 3: ONLY show Audio Call button for 1-on-1 chats. Removed Video entirely.
         if not self._is_group_chat(chat_id):
             tk.Button(
                 btn_frame, text="📞", font=("Segoe UI", 16),
@@ -1554,17 +1559,23 @@ class ChatWindow:
             self.unread_counts[self.current_chat] = 0
             self._update_chat_list()
 
+        last_out_idx = None
         for i, m in enumerate(msgs):
-            self._render_bubble(m)
+            if m.get('outgoing', False):
+                last_out_idx = i
+
+        for i, m in enumerate(msgs):
+            self._render_bubble(m, register_tick=(i == last_out_idx))
 
         self._scroll_to_bottom()
 
-    def _render_bubble(self, msg: dict):
+    def _render_bubble(self, msg: dict, register_tick: bool = False):
         msg_type = msg.get('type', '')
         content  = msg.get('content', '')
         sender   = msg.get('sender', '')
         ts       = msg.get('timestamp', '')
         outgoing = msg.get('outgoing', False)
+        status   = msg.get('status', 'pending')   
         unread   = msg.get('unread', False)
 
         is_notification = (
@@ -1691,6 +1702,13 @@ class ChatWindow:
             time_str = ts.split(' ')[1] if ' ' in ts else ts
             tk.Label(meta, text=time_str, font=FONT_MICRO,
                      fg=C_SECONDARY, bg=bg).pack(side='left')
+            if outgoing:
+                tick_txt, tick_col = self._tick_appearance(status)
+                tick_lbl = tk.Label(meta, text=tick_txt,
+                                    font=("Segoe UI", 9), fg=tick_col, bg=bg)
+                tick_lbl.pack(side='left', padx=(4, 0))
+                if register_tick:
+                    self._tick_labels[self.current_chat] = tick_lbl
 
             self.msg_canvas.update_idletasks()
             self._scroll_to_bottom()
@@ -1727,11 +1745,44 @@ class ChatWindow:
         tk.Label(meta, text=time_str, font=FONT_MICRO, fg=C_SECONDARY, bg=bg
                  ).pack(side='left')
 
+        if outgoing:
+            tick_txt, tick_col = self._tick_appearance(status)
+            tick_lbl = tk.Label(
+                meta, text=tick_txt, font=("Segoe UI", 9),
+                fg=tick_col, bg=bg
+            )
+            tick_lbl.pack(side='left', padx=(4, 0))
+            if register_tick:
+                self._tick_labels[self.current_chat] = tick_lbl
+
         self.msg_canvas.update_idletasks()
         self._scroll_to_bottom()
 
+    @staticmethod
+    def _tick_appearance(status: str) -> tuple:
+        if status == 'read':
+            return '✓✓', C_TICK_BLUE
+        if status == 'delivered':
+            return '✓✓', C_TICK_GREY
+        return '✓', C_TICK_GREY
+
     def _scroll_to_bottom(self):
         self.msg_canvas.yview_moveto(1.0)
+
+    def _update_last_tick(self, chat_id: str, new_status: str):
+        msgs = self.conversations.get(chat_id, [])
+        for m in reversed(msgs):
+            if m.get('outgoing', False):
+                m['status'] = new_status
+                self.history._data.get('conversations', {}).get(chat_id, [])
+                self.history._save_nolock()
+                break
+
+        if chat_id == self.current_chat and chat_id in self._tick_labels:
+            lbl = self._tick_labels.get(chat_id)
+            if lbl and lbl.winfo_exists():
+                txt, col = self._tick_appearance(new_status)
+                lbl.config(text=txt, fg=col)
 
     def _append_message(self, chat_id: str, msg_dict: dict):
         if chat_id not in self.conversations:
@@ -1748,7 +1799,8 @@ class ChatWindow:
             self.unread_counts[chat_id] = self.unread_counts.get(chat_id, 0) + 1
             self._update_chat_list()
         elif is_active and hasattr(self, 'msg_inner'):
-            self._render_bubble(msg_dict)
+            is_last_out = msg_dict.get('outgoing', False)
+            self._render_bubble(msg_dict, register_tick=is_last_out)
             self._update_chat_list()
         else:
             self._update_chat_list()
@@ -1884,6 +1936,7 @@ class ChatWindow:
             'content': text,
             'timestamp': ts,
             'outgoing': True,
+            'status': 'pending',
         })
         self.input_var.set('')
 
@@ -1936,6 +1989,7 @@ class ChatWindow:
             'content':   f'🎤 Voice note  {duration}s',
             'timestamp': ts,
             'outgoing':  True,
+            'status':    'pending',
             'voice_path': path,
             'voice_dur':  duration,
         }
@@ -1963,7 +2017,9 @@ class ChatWindow:
         self.net.request_call(self.current_chat, call_type)
         self._show_status(f"📞 Calling {self.current_chat}…")
         self._open_call_window(self.current_chat, call_type)
-        self.active_call_window.update_status("Ringing...")
+        
+        # THE FIX: Tell the caller that they are calling, not "Connected"
+        self.active_call_window.update_status("Calling...")
 
     def _open_call_window(self, peer: str, call_type: str):
         self.active_call_window = CallWindow(
@@ -2158,6 +2214,7 @@ class ChatWindow:
                 parsed['unread'] = (sender != self.username and
                                     self.current_chat != sender)
                 self._append_message(sender, {**parsed, 'outgoing': False})
+                self._update_last_tick(sender, 'read')
 
             elif parsed['type'] == 'group':
                 group = parsed['group']
@@ -2166,6 +2223,7 @@ class ChatWindow:
                     return
                 parsed['unread'] = (self.current_chat != group)
                 self._append_message(group, {**parsed, 'outgoing': False})
+                self._update_last_tick(group, 'read')
 
             else:
                 content = parsed.get('content', raw_msg)
@@ -2203,7 +2261,13 @@ class ChatWindow:
             def on_accept():
                 self.net.accept_call(caller)
                 self._open_call_window(caller, call_type)
-                # Client symmetric handshake handles the media threads.
+                if self.active_call_window:
+                    self.active_call_window.update_status("Connected")
+                
+                # THE FIX: Tell the Callee to start their UDP threads too!
+                if self.net.call_manager.incoming_caller_addr:
+                    ip, port = self.net.call_manager.incoming_caller_addr
+                    self.net.call_manager.start_symmetric_call(ip, port, call_type)
 
             def on_reject():
                 self.net.reject_call(caller)
@@ -2216,6 +2280,8 @@ class ChatWindow:
         elif etype == 'CALL_RINGING':
             _, peer = event
             self._show_status(f"📞 Ringing {peer}…")
+            if self.active_call_window:
+                self.active_call_window.update_status("Ringing...")
 
         elif etype == 'CALL_CONNECTED':
             _, peer = event
@@ -2245,6 +2311,7 @@ class ChatWindow:
                 'content':  f"📎 Sent file: {filename}",
                 'timestamp': ts,
                 'outgoing': True,
+                'status': 'pending'
             }
             self._append_message(self.username, note)
 
