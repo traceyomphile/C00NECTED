@@ -335,19 +335,20 @@ class CallManager:
     """
 
     def __init__(self, gui_queue: queue.Queue):
-        self.gui_queue              = gui_queue
+        self.gui_queue = gui_queue
         self.udp_sock: socket.socket | None = None
-        self.peer_addr: tuple | None        = None
-        self.call_ended             = True
-        self.call_type              = 'audio'
+        self.peer_addr: tuple | None = None
+        self.call_ended = True
+        self.call_type = 'audio'
         self.incoming_caller_addr: tuple | None = None
         
         # Thread-safe queues for media
-        self.video_frame_queue      = queue.Queue(maxsize=3)
-        self._audio_queue           = queue.Queue(maxsize=50)
-        self._video_queue           = queue.Queue(maxsize=50)
+        self.video_frame_queue = queue.Queue(maxsize=3)
+        self._audio_queue = queue.Queue(maxsize=50)
+        self._video_queue = queue.Queue(maxsize=50)
         
-        self._hole_punched          = threading.Event()
+        self._call_done_event = threading.Event()
+        self._hole_punched = threading.Event()
 
     # ── Socket setup ──────────────────────────────────────────────────────────
 
