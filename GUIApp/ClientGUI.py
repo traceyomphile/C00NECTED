@@ -18,13 +18,10 @@ import pickle
 import pyaudio
 import cv2
 import json
-import wave
 import tempfile
 from datetime import datetime
 import wave as _wave
 import random as _rnd, hashlib as _hs
-
-
 
 try:
     from PIL import Image, ImageTk
@@ -36,7 +33,7 @@ except ImportError:
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-SERVER_IP   = socket.gethostbyname(socket.gethostname())
+SERVER_IP   = '196.47.192.177'
 TCP_PORT    = 50000
 MAX_VIDEO_SECONDS = 45
 
@@ -287,7 +284,7 @@ class VoiceRecorder:
 
         fd, path = tempfile.mkstemp(suffix='.wav', prefix='c00n_voice_')
         os.close(fd)
-        with wave.open(path, 'wb') as wf:
+        with _wave.open(path, 'wb') as wf:
             wf.setnchannels(self.CHANNELS)
             wf.setsampwidth(self._pa.get_sample_size(self.FORMAT))
             wf.setframerate(self.RATE)
@@ -301,7 +298,7 @@ class VoiceRecorder:
         def _play():
             pa = pyaudio.PyAudio()
             try:
-                with wave.open(path, 'rb') as wf:
+                with _wave.open(path, 'rb') as wf:
                     stream = pa.open(
                         format=pa.get_format_from_width(wf.getsampwidth()),
                         channels=wf.getnchannels(),
@@ -327,20 +324,14 @@ class VoiceRecorder:
             pass
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CALL MANAGER  — real UDP audio + video streaming
+# CALL MANAGER  — safe Queue-based UDP dispatcher
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CallManager:
     """
-    Manages real-time UDP audio/video calls.
-
-    Key design:
-    - listen_for_incoming STOPS consuming packets once a call starts.
-      It sets incoming_caller_addr and notifies the GUI, then blocks on
-      a threading.Event until the call ends, then resumes listening.
-    - All audio/video threads (send AND recv) are started together when
-      the user explicitly accepts (or when the outgoing call begins).
-    - No packet-stealing: exactly one thread reads the socket at a time.
+    Manages real-time UDP audio/video calls using the Dispatcher Pattern.
+    Only ONE thread ever reads from the UDP socket to prevent packet stealing.
+    Packets are safely sorted into Queues for playback threads.
     """
 
     def __init__(self, gui_queue: queue.Queue):
@@ -350,16 +341,13 @@ class CallManager:
         self.call_ended             = True
         self.call_type              = 'audio'
         self.incoming_caller_addr: tuple | None = None
+        
+        # Thread-safe queues for media
         self.video_frame_queue      = queue.Queue(maxsize=3)
-        self._audio_queue           = queue.Queue(maxsize=20)
-        self._video_queue           = queue.Queue(maxsize=5)
-        self._udp_dispatcher_thread = None
-        self._call_handlers = {} # pkt_type -> handler
-
-        # Event that pauses the listener while a call is active
-        self._call_done_event       = threading.Event()
-        self._call_done_event.set()   # initially "done" = listener may run
-        #self._hole_punched          = threading.Event()
+        self._audio_queue           = queue.Queue(maxsize=50)
+        self._video_queue           = queue.Queue(maxsize=50)
+        
+        self._hole_punched          = threading.Event()
 
     # ── Socket setup ──────────────────────────────────────────────────────────
 
@@ -371,36 +359,72 @@ class CallManager:
                 pass
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_sock.bind(('0.0.0.0', 0))
-        # Enable reuse so we can rebind quickly after call ends
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
         return self.udp_sock.getsockname()[1]
 
+    # ── Safe UDP Dispatcher Thread ────────────────────────────────────────────
+
+    def start_dispatcher(self):
+        """Starts the single central reader thread for all UDP packets."""
+        threading.Thread(target=self._udp_dispatch_loop, daemon=True).start()
+
+    def _udp_dispatch_loop(self):
+        """Central UDP packet mailroom. It reads ALL packets and sorts them."""
+        self.udp_sock.settimeout(1.0)
+        while True:
+            try:
+                datagram, addr = self.udp_sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+            if not datagram:
+                continue
+
+            if datagram in (b'PUNCH', b'PUNCH_ACK'):
+                self.handle_punch_response(addr)
+                continue
+
+            pkt_type = datagram[0:1]
+
+            if self.call_ended:
+                # If we are not in a call, watch for incoming call packets
+                if pkt_type in (PKT_AUDIO, PKT_VIDEO):
+                    if self.incoming_caller_addr != addr:
+                        self.incoming_caller_addr = addr
+                        # Let the GUI know an incoming UDP call arrived
+                        self.gui_queue.put(("INCOMING_CALL_UDP",))
+            else:
+                # We are in a call: Sort packets into their specific playback queues
+                if pkt_type == PKT_AUDIO:
+                    if not self._audio_queue.full():
+                        self._audio_queue.put_nowait(datagram[1:])
+                elif pkt_type == PKT_VIDEO:
+                    if not self._video_queue.full():
+                        self._video_queue.put_nowait(datagram)
+                elif pkt_type == PKT_END:
+                    self.call_ended = True
+                    self.gui_queue.put(("CALL_ENDED_REMOTE",))
+
     # ── Outgoing call (caller side) ───────────────────────────────────────────
 
     def start_outgoing_call(self, peer_ip: str, peer_udp_port: int, call_type: str = 'audio'):
-        """Server returned CALL_PEER_INFO — stop the listener, start all threads."""
         self._begin_call(call_type)
         self.peer_addr = (peer_ip, int(peer_udp_port))
 
-        # Start UDP dispatcher if not running
-        self._start_udp_dispatcher()
-
-        # HOLE PUNCHING: Send dummy packets until we get response
-        self._hole_punched = threading.Event()
+        self._hole_punched.clear()
         threading.Thread(target=self._hole_punch_worker, daemon=True).start()
 
-        # Wait for punch through or timeout
         if not self._hole_punched.wait(timeout=10.0):
             self.gui_queue.put(('STATUS', 'Call failed: NAT traversal timeout'))
             self.end_call()
             return
         
-        # Start media threads
         self._start_media_threads(call_type)
 
     def _hole_punch_worker(self):
-        """Send punch packets until peer responds."""
         punch_packet = b'PUNCH'
         while not self.call_ended and not self._hole_punched.is_set():
             if self.peer_addr:
@@ -408,10 +432,8 @@ class CallManager:
                 time.sleep(0.25)
 
     def handle_punch_response(self, addr):
-        """Called by dispatcher when punch ACK is received."""
         if not self._hole_punched.is_set():
             self._hole_punched.set()
-            # Send ACK back to ensure peer's NAT is open too
             self.udp_sock.sendto(b'PUNCH_ACK', addr)
 
     def _start_media_threads(self, call_type: str):
@@ -424,11 +446,6 @@ class CallManager:
     # ── Accepting an incoming call (callee side) ──────────────────────────────
 
     def accept_incoming_call(self, call_type: str = 'audio'):
-        """User clicked Accept — start ALL send+recv threads at once."""
-        wait_start = time.time()
-        while not self.incoming_caller_addr and time.time() - wait_start < 5.0:
-            time.sleep(0.1)
-
         if not self.incoming_caller_addr:
             self.gui_queue(('STATUS', 'Call accept failed: no caller address'))
             return False
@@ -436,72 +453,18 @@ class CallManager:
         self._begin_call(call_type)
         self.peer_addr = self.incoming_caller_addr
 
-        # Start UDP dispatcher firs
-        self._start_udp_dispatcher()
+        # Start UDP dispatcher first
+        #self._start_udp_dispatcher()
 
         # Send punch ACK to open our NAT to them
         self.udp_sock.sendto(b'PUNCH_ACK', self.peer_addr)
-
-
-        self.udp_sock.settimeout(0.5)
 
         self._start_media_threads(call_type)
         return True
 
     def _begin_call(self, call_type: str):
-        self.call_ended    = False
-        self.call_type     = call_type
-        self._call_done_event.clear()   # tell the listener to pause
-
-    
-    def _start_udp_dispatcher(self):
-        """Single thread that reads all UDP and dispatches to handlers."""
-        if self._udp_dispatcher_thread:
-            return
-        
-        self._udp_dispatcher_thread = threading.Thread(
-            target=self._udp_dispatch_loop,
-            daemon=True
-        )
-        self._udp_dispatcher_thread.start()
-
-
-    def _udp_dispatch_loop(self):
-        """Central UDP packet dispatcher - runs always."""
-        while True:
-            try:
-                datagram, addr = self.udp_sock.recvfrom(65535)
-
-                if not datagram:
-                    continue
-
-                pkt_type = datagram[0:1]
-
-                if datagram in (b'PUNCH', b'PUNCH_ACK'):
-                    self.handle_punch_response(addr)
-                    continue
-
-                if self.call_ended:
-                    # No active call — only care about detecting an incoming one
-                    if pkt_type in (PKT_AUDIO, PKT_VIDEO):
-                        self.incoming_caller_addr = addr
-                        self.gui_queue.put(("INCOMING_CALL_UDP",))
-                else:
-                    if pkt_type == PKT_AUDIO:
-                        if not self._audio_queue.full():
-                            self._audio_queue.put_nowait(datagram[1:])
-                    elif pkt_type == PKT_VIDEO:
-                        if not self._video_queue.full():
-                            self._video_queue.put_nowait(datagram[5:])
-                    elif pkt_type == PKT_END:
-                        self.call_ended = True
-                        self._call_done_event.set()
-                        self.gui_queue.put(("CALL_ENDED_REMOTE",))
-
-            except socket.timeout:
-                continue
-            except Exception as e:
-                print(f"[UDP DISPATCH ERROR] {e}")
+        self.call_ended = False
+        self.call_type  = call_type
 
     # ── End call ─────────────────────────────────────────────────────────────
 
@@ -515,10 +478,17 @@ class CallManager:
         self.peer_addr = None
         self.incoming_caller_addr = None
 
+        # Flush stale packets out of the queues
+        while not self._audio_queue.empty():
+            try: self._audio_queue.get_nowait()
+            except: break
+        while not self._video_queue.empty():
+            try: self._video_queue.get_nowait()
+            except: break
         while not self.video_frame_queue.empty():
             try: self.video_frame_queue.get_nowait()
             except: break
-
+        
         self._call_done_event.set()     # let the listener resume
 
     # ── Background listener ───────────────────────────────────────────────────
@@ -534,9 +504,6 @@ class CallManager:
         while True:
             # Block here while a call is active — dispatcher owns the socket
             self._call_done_event.wait()
-
-            if self.call_ended:
-                continue
 
             try:
                 datagram, addr = self.udp_sock.recvfrom(65535)
@@ -559,6 +526,7 @@ class CallManager:
             self.incoming_caller_addr = addr
             self._call_done_event.clear()   # pause listener until call ends
             self.gui_queue.put(('INCOMING_CALL_UDP',))
+            # Listener is now paused; call threads will take over the socket
 
     # ── Audio threads ─────────────────────────────────────────────────────────
 
@@ -574,14 +542,11 @@ class CallManager:
                 pcm = stream.read(AUDIO_CHUNK, exception_on_overflow=False)
                 if self.peer_addr:
                     self.udp_sock.sendto(PKT_AUDIO + pcm, self.peer_addr)
-        
         except Exception as e:
             if not self.call_ended:
                 self.gui_queue.put(('STATUS', f'[Call] Audio send error: {e}'))
-        
         finally:
-            #if stream:
-            if 'stream' in locals():
+            if stream:
                 stream.stop_stream()
                 stream.close()
             pa.terminate()
@@ -594,29 +559,21 @@ class CallManager:
                 format=AUDIO_FORMAT, channels=AUDIO_CHANNELS,
                 rate=AUDIO_RATE, output=True, frames_per_buffer=AUDIO_CHUNK
             )
-
             while not self.call_ended:
                 try:
-                    datagram, _ = self.udp_sock.recvfrom(65535)
-                    if datagram[0:1] == PKT_END:
-                        self.call_ended = True
-                        self.gui_queue.put(('CALL_ENDED_REMOTE'))
-                        break
-
-                    if datagram[0:1] == PKT_AUDIO:
-                        stream.write(datagram[1:])
-                except socket.timeout:
+                    # Safely pull ONLY audio packets from the mailroom queue
+                    payload = self._audio_queue.get(timeout=0.5)
+                    stream.write(payload)
+                except queue.Empty:
                     continue
-
         except Exception as e:
             if not self.call_ended:
                 self.gui_queue.put(('STATUS', f'[Call] Audio recv error: {e}'))
-
         finally:
-            if 'stream' in locals():
-                stream.stop_stream(); stream.close()
+            if stream:
+                stream.stop_stream()
+                stream.close()
             pa.terminate()
-            self._call_done_event.set()   # always release listener on exit
 
     # ── Video threads ─────────────────────────────────────────────────────────
     
@@ -625,9 +582,7 @@ class CallManager:
         try:
             while not self.call_ended:
                 ret, frame = cap.read()
-
-                if not ret: 
-                    break
+                if not ret: break
 
                 small   = cv2.resize(frame, (320, 240))
                 payload = pickle.dumps(small, protocol=4)
@@ -635,24 +590,18 @@ class CallManager:
 
                 if self.peer_addr:
                     self.udp_sock.sendto(PKT_VIDEO + length + payload, self.peer_addr)
-        
         except Exception as e:
             if not self.call_ended:
                 self.gui_queue.put(('STATUS', f'[Call] Video send error: {e}'))
-        
         finally:
             cap.release()
 
     def _recv_video(self):
         while not self.call_ended:
             try:
-                datagram, _ =self.udp_sock.recvfrom(65535)
-                if datagram[0:1] == PKT_END:
-                    self.call_ended= True
-                    self._call_done_event.set()
-                    break
-
-                if datagram[0:1] != PKT_VIDEO or len(datagram) < 5:
+                # Safely pull ONLY video packets from the mailroom queue
+                datagram = self._video_queue.get(timeout=0.5)
+                if len(datagram) < 5:
                     continue
 
                 length = struct.unpack('>I', datagram[1:5])[0]
@@ -662,13 +611,10 @@ class CallManager:
                 if not self.video_frame_queue.full():
                     self.video_frame_queue.put_nowait(frame)
 
-            except socket.timeout:
+            except queue.Empty:
                 continue
-            except Exception:
-                break
-
-        self._call_done_event.set()
-
+            except Exception as e:
+                continue
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NETWORK CLIENT
@@ -734,9 +680,11 @@ class NetworkClient:
         send_framed_msg(self.tcp_sock, f"PORT:{media_port}", 'A')
         send_framed_msg(self.tcp_sock, f"CALL_PORT:{udp_port}", 'A')
 
-        threading.Thread(target=self._recv_tcp_media,   daemon=True).start()
+        threading.Thread(target=self._recv_tcp_media, daemon=True).start()
         threading.Thread(target=self._recv_tcp_messages, daemon=True).start()
-        threading.Thread(target=self.call_manager.listen_for_incoming, daemon=True).start()
+        
+        # Start the UDP Dispatcher mailroom
+        self.call_manager.start_dispatcher()
 
         # Deliver any queued offline messages immediately
         send_framed_msg(self.tcp_sock, "FLUSH_OFFLINE:", 'C')
@@ -883,8 +831,6 @@ class NetworkClient:
                     caller    = parts[1]
                     call_type = "audio" if msg.startswith("AUDIO_CALL:") else "video"
                     # Server now includes caller's IP and UDP port in the notification.
-                    # Set incoming_caller_addr immediately so accept_incoming_call()
-                    # never sees None (fixes the race with the UDP listener).
                     if len(parts) >= 4:
                         caller_ip       = parts[2]
                         caller_udp_port = int(parts[3])
@@ -924,9 +870,6 @@ class NetworkClient:
 
                 # ── Base64 file download ──
                 if msg_type == 'D' and msg.startswith("FILE:"):
-                    # Format: FILE:<filename>:<filetype>:<base64>:<sender>
-                    # Use maxsplit=4 so b64 data (which may contain ':') is never truncated
-                    # and sender is cleanly separated as the 5th field.
                     parts = msg.split(":", 4)
                     if len(parts) >= 4:
                         filename  = parts[1]
@@ -952,7 +895,6 @@ class NetworkClient:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((target_ip, target_port))
 
-            # Include sender username so receiver can attribute correctly
             sock.sendall(f"FILE:{filename}:{filesize}:{self.username}\n".encode('utf-8'))
             with open(filepath, 'rb') as f:
                 while chunk := f.read(4096):
@@ -995,7 +937,6 @@ class NetworkClient:
 
     def _handle_file_conn(self, conn: socket.socket, addr):
         try:
-            # Read the newline-terminated header in one buffered call
             rfile  = conn.makefile('rb')
             raw    = rfile.readline(1024)
             if not raw:
@@ -1070,13 +1011,11 @@ class SplashScreen:
         self.frame = tk.Frame(self.root, bg=C_BG)
         self.frame.place(relx=0, rely=0, relwidth=1, relheight=1)
 
-        # Full-window canvas so the logo always fills the available space
         self.canvas = tk.Canvas(self.frame, bg=C_BG, highlightthickness=0)
         self.canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
 
-        # Draw once now, redraw if window is resized
         self.frame.bind("<Configure>", lambda _e: self._redraw())
-        self.root.after(50, self._redraw)   # initial draw after layout settles
+        self.root.after(50, self._redraw)   
 
     def _redraw(self):
         self.canvas.delete("all")
@@ -1086,12 +1025,9 @@ class SplashScreen:
             return
 
         cy = int(H * 0.42)
-
-        # Scale font to ~18 % of window width, clamped 40–96 pt
         font_size = max(40, min(96, int(W * 0.085)))
         font      = ("Consolas", font_size, "bold")
 
-        # Measure total width by spacing characters manually
         chars = [
             ("C", C_TEXT),
             ("0", C_GREEN),
@@ -1103,7 +1039,7 @@ class SplashScreen:
             ("E", C_TEXT),
             ("D", C_TEXT),
         ]
-        spacing = int(font_size * 0.72)   # px between character centres
+        spacing = int(font_size * 0.72)   
         total_w = spacing * (len(chars) - 1)
         x_start = (W - total_w) // 2
 
@@ -1113,7 +1049,6 @@ class SplashScreen:
                 text=ch, font=font, fill=col, anchor='center'
             )
 
-        # Underline glow
         line_y = cy + int(font_size * 0.60)
         margin = int(W * 0.06)
         self.canvas.create_line(
@@ -1121,7 +1056,6 @@ class SplashScreen:
             fill=C_GREEN, width=2, dash=(10, 7)
         )
 
-        # Tagline
         self.canvas.create_text(
             W // 2, line_y + int(H * 0.07),
             text="connect  •  chat  •  call",
@@ -1129,7 +1063,6 @@ class SplashScreen:
             fill=C_SECONDARY, anchor='center'
         )
 
-        # Animated dots (redrawn as canvas text so they survive clear)
         dot_char = "●" * (getattr(self, '_dot_n', 0) % 4)
         self._dot_id = self.canvas.create_text(
             W // 2, line_y + int(H * 0.15),
@@ -1167,10 +1100,8 @@ class AuthWindow:
         self.root       = root
         self.net        = net
         self.on_success = on_success
-        self._entries   = {}   # name → (var, entry, canvas_id)
+        self._entries   = {}   
         self._build_login()
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _clear(self):
         for w in self.root.winfo_children():
@@ -1178,27 +1109,20 @@ class AuthWindow:
         self._entries = {}
 
     def _bg_frame(self) -> tk.Frame:
-        """Full-window background frame."""
         f = tk.Frame(self.root, bg=C_BG)
         f.place(relx=0, rely=0, relwidth=1, relheight=1)
         return f
 
     def _card(self, bg_frame) -> tk.Frame:
-        """Centred card."""
         card = tk.Frame(bg_frame, bg=C_SIDEBAR, padx=32, pady=36)
         card.place(relx=0.5, rely=0.5, anchor='center', width=self.CARD_W)
         return card
 
     def _rounded_field(self, parent, placeholder: str, show: str = '') -> tk.StringVar:
-        """
-        Entry field drawn inside a Canvas to get the rounded-rectangle border
-        that matches the screenshot.
-        """
         var   = tk.StringVar()
         outer = tk.Frame(parent, bg=C_SIDEBAR)
         outer.pack(fill='x', pady=(0, 12))
 
-        # Canvas provides the rounded-rect background + border
         cv = tk.Canvas(outer, bg=C_SIDEBAR, highlightthickness=0,
                        height=48, bd=0)
         cv.pack(fill='x')
@@ -1207,14 +1131,12 @@ class AuthWindow:
             cv.delete('bg')
             w, h = cv.winfo_width() or self.CARD_W - 64, cv.winfo_height()
             r = 10
-            # filled rounded rect
             cv.create_arc( 0,  0, 2*r, 2*r, start= 90, extent= 90, fill=C_HEADER, outline='', tags='bg')
             cv.create_arc(w-2*r, 0, w, 2*r, start=  0, extent= 90, fill=C_HEADER, outline='', tags='bg')
             cv.create_arc( 0, h-2*r, 2*r, h, start=180, extent= 90, fill=C_HEADER, outline='', tags='bg')
             cv.create_arc(w-2*r, h-2*r, w, h, start=270, extent= 90, fill=C_HEADER, outline='', tags='bg')
             cv.create_rectangle(r, 0, w-r, h, fill=C_HEADER, outline='', tags='bg')
             cv.create_rectangle(0, r, w, h-r, fill=C_HEADER, outline='', tags='bg')
-            # border arc
             cv.create_arc( 0,  0, 2*r, 2*r, start= 90, extent= 90, outline=C_BORDER, tags='bg')
             cv.create_arc(w-2*r, 0, w, 2*r, start=  0, extent= 90, outline=C_BORDER, tags='bg')
             cv.create_arc( 0, h-2*r, 2*r, h, start=180, extent= 90, outline=C_BORDER, tags='bg')
@@ -1249,16 +1171,13 @@ class AuthWindow:
         entry.bind('<FocusIn>',  _on_focus_in)
         entry.bind('<FocusOut>', _on_focus_out)
 
-        # Place entry inside canvas with padding
         cv.create_window(16, 24, anchor='w', window=entry, width=self.CARD_W - 96)
 
         self._entries[placeholder] = (var, entry)
         return var
 
     def _get_field(self, placeholder: str) -> str:
-        """Get the actual value, returning '' if still showing placeholder."""
         var, _ = self._entries.get(placeholder, (None, None))
-        
         if var is None: 
             return ''
         val = var.get().strip()
@@ -1286,15 +1205,12 @@ class AuthWindow:
         lbl.pack(pady=(0, 6))
         return lbl
 
-    # ── LOGIN ─────────────────────────────────────────────────────────────────
-
     def _build_login(self):
         self._clear()
         self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         bg  = self._bg_frame()
         card = self._card(bg)
 
-        # "Log in" heading
         tk.Label(card, text="Log in",
                  font=("Segoe UI", 26, "bold"), fg=C_TEXT, bg=C_SIDEBAR
                  ).pack(anchor='w', pady=(0, 22))
@@ -1305,7 +1221,6 @@ class AuthWindow:
         self._login_err = self._err_label(card)
         self._blue_btn(card, "Log in", self._do_login)
 
-        # — Or — divider
         div = tk.Frame(card, bg=C_SIDEBAR)
         div.pack(fill='x', pady=(4, 12))
         tk.Frame(div, bg=C_BORDER, height=1).pack(side='left',  fill='x', expand=True, pady=8)
@@ -1342,8 +1257,6 @@ class AuthWindow:
             self._login_err.config(text="Already logged in elsewhere.")
         else:
             self._login_err.config(text="Incorrect password.")
-
-    # ── REGISTER ──────────────────────────────────────────────────────────────
 
     def _build_register(self):
         self._clear()
@@ -1444,13 +1357,10 @@ class CallWindow(tk.Toplevel):
 
         self._tick_timer()
 
-    # ── Audio call UI ─────────────────────────────────────────────────────────
-
     def _build_audio_ui(self):
         tk.Label(self, text="🎙️  Audio Call", font=("Segoe UI", 12, "bold"),
                  fg=C_SECONDARY, bg=C_HEADER).pack(pady=(24, 4))
 
-        # Avatar circle
         c = tk.Canvas(self, width=120, height=120, bg=C_HEADER, highlightthickness=0)
         c.pack(pady=20)
         c.create_oval(5, 5, 115, 115, fill=C_GREEN, outline='')
@@ -1472,8 +1382,6 @@ class CallWindow(tk.Toplevel):
         if self._running:
             self.status_lbl.config(text=text)
 
-    # ── Video call UI ─────────────────────────────────────────────────────────
-
     def _build_video_ui(self):
         top = tk.Frame(self, bg=C_HEADER, height=30)
         top.pack(fill='x')
@@ -1483,7 +1391,6 @@ class CallWindow(tk.Toplevel):
                                   fg=C_TEXT, bg=C_HEADER)
         self.timer_lbl.pack(side='right', padx=14)
 
-        # Remote video
         self.remote_canvas = tk.Canvas(self, width=700, height=440,
                                        bg='#000', highlightthickness=0)
         self.remote_canvas.pack()
@@ -1491,7 +1398,6 @@ class CallWindow(tk.Toplevel):
             350, 220, text="Waiting for video…", font=FONT_SUB, fill=C_SECONDARY
         )
 
-        # Local PiP (bottom-right)
         self.local_canvas = tk.Canvas(self, width=140, height=105,
                                       bg='#111', highlightthickness=0)
         self.local_canvas.place(x=545, y=320)
@@ -1518,11 +1424,7 @@ class CallWindow(tk.Toplevel):
             cursor='hand2', command=self._end_call
         ).pack(side='left', padx=10)
 
-    # ── Logic ─────────────────────────────────────────────────────────────────
-
     def _toggle_mute(self):
-        # Toggle the call_ended flag for audio-send thread only would need more
-        # refactoring; simple visual feedback for now
         self._muted = not self._muted
         self.mute_btn.config(text="🔇" if self._muted else "🎤",
                              bg=C_AMBER if self._muted else C_INPUT_BG)
@@ -1557,13 +1459,12 @@ class CallWindow(tk.Toplevel):
                 photo = ImageTk.PhotoImage(img)
                 self.remote_canvas.delete(self._no_vid_id)
                 self.remote_canvas.create_image(0, 0, anchor='nw', image=photo)
-                self.remote_canvas._photo = photo  # prevent GC
+                self.remote_canvas._photo = photo  
         except queue.Empty:
             pass
         self.after(30, self._poll_remote_video)
 
     def _capture_local_video(self):
-        """Show local webcam in the PiP canvas."""
         self._local_cap = cv2.VideoCapture(0)
         threading.Thread(target=self._local_video_thread, daemon=True).start()
 
@@ -1627,7 +1528,6 @@ class IncomingCallDialog(tk.Toplevel):
                   font=FONT_BOLD, relief='flat', padx=18, pady=8,
                   cursor='hand2', command=self._reject).pack(side='left', padx=12)
 
-        # Ring animation
         self._ring_index = 0
         self._ring()
 
@@ -1654,12 +1554,6 @@ class IncomingCallDialog(tk.Toplevel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ChatWindow:
-    """
-    Main WhatsApp-like chat interface.
-    Left: sidebar with conversation list.
-    Right: message area + input bar.
-    """
-
     def __init__(self, root: tk.Tk, net: NetworkClient, username: str,
                  gui_queue: queue.Queue):
         self.root       = root
@@ -1669,7 +1563,6 @@ class ChatWindow:
 
         self.history    = HistoryStore(username)
 
-        # Restore persisted conversations and group knowledge
         self.conversations: dict[str, list] = {
             k: list(v) for k, v in self.history.conversations.items()
         }
@@ -1677,28 +1570,23 @@ class ChatWindow:
         self.current_chat: str | None       = None
         self.active_call_window: CallWindow | None = None
         self._pending_call_info: tuple | None   = None
-        self._groups_to_verify:   list          = []    # startup purge queue
-        self._verifying_group:    str | None    = None  # group currently being probed on startup
+        self._groups_to_verify:   list          = []    
+        self._verifying_group:    str | None    = None  
 
-        # Unread message counts per chat (not persisted — reset on login)
         self.unread_counts: dict[str, int]  = {}
-        # Tick label registry
         self._tick_labels: dict[str, tk.Label] = {}
-        # Voice note recorder
         self._voice_rec   = VoiceRecorder()
         self._is_recording = False
 
-        # Scrub any SYSTEM pseudo-conversation persisted by the old bug
         if 'SYSTEM' in self.conversations:
             del self.conversations['SYSTEM']
             self.history.delete_chat('SYSTEM')
 
         self._clear_root()
         self._build_layout()
-        self._update_chat_list()   # populate sidebar from restored history
+        self._update_chat_list()   
         self._start_event_loop()
-        # Kick off sequential server-side verification of all persisted groups
-        # so any stale ones are silently removed from the sidebar on login.
+        
         self.root.after(200, self._start_group_purge)
 
     def _clear_root(self):
@@ -1716,7 +1604,6 @@ class ChatWindow:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _on_close(self):
-        """Graceful shutdown — mirrors the console client's EXIT flow."""
         try:
             self.net.disconnect()
         except Exception:
@@ -1726,28 +1613,21 @@ class ChatWindow:
         except Exception:
             pass
 
-    # ── Layout ────────────────────────────────────────────────────────────────
-
     def _build_layout(self):
         self.root.columnconfigure(0, weight=0)
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        # ── Sidebar ──
         self.sidebar = tk.Frame(self.root, bg=C_SIDEBAR, width=420)
         self.sidebar.grid(row=0, column=0, sticky='nsew')
         self.sidebar.grid_propagate(False)
         self._build_sidebar()
 
-        # ── Right panel ──
         self.right = tk.Frame(self.root, bg=C_PANEL)
         self.right.grid(row=0, column=1, sticky='nsew')
         self._build_empty_right()
 
-    # ─────────────────  SIDEBAR  ──────────────────────────────────────────────
-
     def _build_sidebar(self):
-        # Header
         hdr = tk.Frame(self.sidebar, bg=C_HEADER, height=64)
         hdr.pack(fill='x')
         hdr.pack_propagate(False)
@@ -1755,14 +1635,12 @@ class ChatWindow:
         tk.Label(hdr, text="C00NECTED", font=("Consolas", 14, "bold"),
                  fg=C_GREEN, bg=C_HEADER).pack(side='left', padx=16, pady=14)
 
-        # Toolbar buttons
         for txt, cmd in [("＋", self._new_chat_menu), ("⋮", self._overflow_menu)]:
             b = tk.Button(hdr, text=txt, font=("Segoe UI", 14),
                           bg=C_HEADER, fg=C_SECONDARY, relief='flat',
                           cursor='hand2', command=cmd)
             b.pack(side='right', padx=6)
 
-        # Search
         sf = tk.Frame(self.sidebar, bg=C_SIDEBAR, pady=8, padx=10)
         sf.pack(fill='x')
         self.search_var = tk.StringVar()
@@ -1775,7 +1653,6 @@ class ChatWindow:
         s_entry.bind("<FocusIn>", lambda e: s_entry.delete(0, 'end')
                      if s_entry.get().startswith("🔍") else None)
 
-        # Custom scrollable chat list with canvas-drawn icons
         list_frame = tk.Frame(self.sidebar, bg=C_SIDEBAR)
         list_frame.pack(fill='both', expand=True)
 
@@ -1811,7 +1688,6 @@ class ChatWindow:
             )
         )
 
-        # User info footer
         foot = tk.Frame(self.sidebar, bg=C_HEADER, height=52)
         foot.pack(fill='x', side='bottom')
         foot.pack_propagate(False)
@@ -1821,8 +1697,6 @@ class ChatWindow:
                  fg=C_TEXT, bg=C_HEADER).place(x=54, y=8)
         tk.Label(foot, text="● Online", font=FONT_MICRO,
                  fg=C_ONLINE, bg=C_HEADER).place(x=54, y=28)
-
-    # ─────────────────  RIGHT PANEL  ──────────────────────────────────────────
 
     def _build_empty_right(self):
         for w in self.right.winfo_children():
@@ -1843,12 +1717,10 @@ class ChatWindow:
         self.right.rowconfigure(2, weight=0)
         self.right.columnconfigure(0, weight=1)
 
-        # ── Chat header ──
         hdr = tk.Frame(self.right, bg=C_HEADER, height=64)
         hdr.grid(row=0, column=0, sticky='ew')
         hdr.grid_propagate(False)
 
-        # Avatar
         cv = tk.Canvas(hdr, width=40, height=40, bg=C_GREEN,
                        highlightthickness=0)
         cv.place(x=14, y=12)
@@ -1861,7 +1733,6 @@ class ChatWindow:
                                         font=FONT_SMALL, fg=C_SECONDARY, bg=C_HEADER)
         self.chat_status_lbl.place(x=68, y=30)
 
-        # Call buttons (right side)
         btn_frame = tk.Frame(hdr, bg=C_HEADER)
         btn_frame.place(relx=1.0, rely=0.5, anchor='e', x=-12)
 
@@ -1873,14 +1744,12 @@ class ChatWindow:
                 command=lambda ct=ctype: self._start_call(ct)
             ).pack(side='left', padx=4)
 
-        # Group options button
         tk.Button(
             btn_frame, text="⋮", font=("Segoe UI", 16),
             bg=C_HEADER, fg=C_SECONDARY, relief='flat',
             cursor='hand2', command=self._group_options_menu
         ).pack(side='left', padx=4)
 
-        # ── Messages area ──
         msg_frame = tk.Frame(self.right, bg=C_PANEL)
         msg_frame.grid(row=1, column=0, sticky='nsew')
 
@@ -1902,23 +1771,19 @@ class ChatWindow:
         self.msg_inner.bind('<Configure>', self._on_msg_frame_configure)
         self.msg_canvas.bind('<Configure>', self._on_canvas_configure)
 
-        # Mousewheel scroll
         self.msg_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
-        # ── Input bar ──
         input_bar = tk.Frame(self.right, bg=C_INPUT_BG, height=64)
         input_bar.grid(row=2, column=0, sticky='ew')
         input_bar.grid_propagate(False)
         input_bar.columnconfigure(1, weight=1)
 
-        # Attach button
         tk.Button(
             input_bar, text="📎", font=("Segoe UI", 16),
             bg=C_INPUT_BG, fg=C_SECONDARY, relief='flat',
             cursor='hand2', command=self._send_file
         ).grid(row=0, column=0, padx=(10, 4), pady=12)
 
-        # Text entry
         self.input_var = tk.StringVar()
         self.input_entry = tk.Entry(
             input_bar, textvariable=self.input_var,
@@ -1929,7 +1794,6 @@ class ChatWindow:
         self.input_entry.bind("<Return>", lambda _: self._send_message())
         self.input_entry.focus()
 
-        # Mic button (hold to record)
         self._mic_btn = tk.Button(
             input_bar, text="🎤", font=("Segoe UI", 16),
             bg=C_INPUT_BG, fg=C_SECONDARY, relief='flat', cursor='hand2'
@@ -1938,14 +1802,12 @@ class ChatWindow:
         self._mic_btn.bind("<ButtonPress-1>",   lambda _e: self._start_voice_recording())
         self._mic_btn.bind("<ButtonRelease-1>", lambda _e: self._stop_voice_recording())
 
-        # Send button
         tk.Button(
             input_bar, text="➤", font=("Segoe UI", 16),
             bg=C_INPUT_BG, fg=C_ACCENT, relief='flat',
             cursor='hand2', command=self._send_message
         ).grid(row=0, column=3, padx=(0, 10), pady=12)
 
-        # Render stored messages
         self._render_all_messages()
 
     def _on_msg_frame_configure(self, _event=None):
@@ -1958,27 +1820,22 @@ class ChatWindow:
         if hasattr(self, 'msg_canvas'):
             self.msg_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-    # ─────────────────  MESSAGES  ─────────────────────────────────────────────
-
     def _render_all_messages(self):
         for w in self.msg_inner.winfo_children():
             w.destroy()
         msgs = self.conversations.get(self.current_chat, [])
 
-        # Mark all incoming unread messages as read when opening the chat
         changed = False
         for m in msgs:
             if not m.get('outgoing', False) and m.get('unread', False):
                 m['unread'] = False
                 changed = True
         if changed:
-            # Persist the updated read flags
             self.history._data['conversations'][self.current_chat] = msgs
             self.history._save_nolock()
             self.unread_counts[self.current_chat] = 0
             self._update_chat_list()
 
-        # Find the index of the last outgoing message (needs tick registration)
         last_out_idx = None
         for i, m in enumerate(msgs):
             if m.get('outgoing', False):
@@ -1990,28 +1847,20 @@ class ChatWindow:
         self._scroll_to_bottom()
 
     def _render_bubble(self, msg: dict, register_tick: bool = False):
-        """
-        Render one message.  Three visual modes:
-          • Notification pill  — SYSTEM-sender messages (group join/leave/add)
-          • Outgoing bubble    — right-aligned teal, shows delivery tick
-          • Incoming bubble    — left-aligned dark, shows sender name in groups
-        """
         msg_type = msg.get('type', '')
         content  = msg.get('content', '')
         sender   = msg.get('sender', '')
         ts       = msg.get('timestamp', '')
         outgoing = msg.get('outgoing', False)
-        status   = msg.get('status', 'pending')   # pending / delivered / queued
+        status   = msg.get('status', 'pending')   
         unread   = msg.get('unread', False)
 
-        # ── 1. Notification pill (SYSTEM messages) ────────────────────────────
         is_notification = (
             msg_type == 'system'
             or (msg_type == 'group' and sender == 'SYSTEM')
             or (msg_type == 'dm'   and sender == 'SYSTEM')
         )
         if is_notification:
-            # Outgoing system notes (e.g. file sent) → right-aligned styled bubble
             if outgoing:
                 outer = tk.Frame(self.msg_inner, bg=C_PANEL)
                 outer.pack(fill='x', padx=8, pady=2)
@@ -2028,7 +1877,6 @@ class ChatWindow:
                 self.msg_canvas.update_idletasks()
                 self._scroll_to_bottom()
                 return
-            # Incoming / server notifications → centered pill
             pill_frame = tk.Frame(self.msg_inner, bg=C_PANEL)
             pill_frame.pack(fill='x', pady=6)
             pill = tk.Frame(pill_frame, bg='#1A3040', padx=14, pady=5)
@@ -2042,7 +1890,6 @@ class ChatWindow:
             self._scroll_to_bottom()
             return
 
-        # ── 2. Regular system noise (non-SYSTEM-sender) ───────────────────────
         if msg_type == 'system':
             tk.Label(
                 self.msg_inner, text=content, font=FONT_MICRO,
@@ -2050,7 +1897,6 @@ class ChatWindow:
             ).pack(padx=60, pady=2)
             return
 
-        # ── 3. Voice note bubble ──────────────────────────────────────────────
         if msg_type == 'voice':
             outer = tk.Frame(self.msg_inner, bg=C_PANEL)
             outer.pack(fill='x', padx=8, pady=2)
@@ -2069,7 +1915,6 @@ class ChatWindow:
             voice_path = msg.get('voice_path', '')
             dur        = msg.get('voice_dur', 0)
 
-            # Play button — changes to ⏸ while playing, re-enables when done
             play_btn = tk.Button(
                 row, text="▶", font=("Segoe UI", 14),
                 bg=C_ACCENT, fg=C_TEXT, relief='flat',
@@ -2089,7 +1934,7 @@ class ChatWindow:
                 def _run():
                     try:
                         pa = pyaudio.PyAudio()
-                        with wave.open(path, 'rb') as wf:
+                        with _wave.open(path, 'rb') as wf:
                             stream = pa.open(
                                 format=pa.get_format_from_width(wf.getsampwidth()),
                                 channels=wf.getnchannels(),
@@ -2115,7 +1960,6 @@ class ChatWindow:
 
             play_btn.config(command=_on_play)
 
-            # Waveform bars (seeded from path so always consistent)
             bar_cv = tk.Canvas(row, bg=bg, highlightthickness=0, width=110, height=30)
             bar_cv.pack(side='left')
     
@@ -2130,7 +1974,6 @@ class ChatWindow:
             tk.Label(row, text=f"{dur}s", font=FONT_MICRO,
                      fg=C_SECONDARY, bg=bg).pack(side='left', padx=(6, 0))
 
-            # Meta row: time + tick
             meta = tk.Frame(bubble, bg=bg)
             meta.pack(anchor='e')
             time_str = ts.split(' ')[1] if ' ' in ts else ts
@@ -2148,7 +1991,6 @@ class ChatWindow:
             self._scroll_to_bottom()
             return
 
-        # ── 4. Chat bubble ────────────────────────────────────────────────────
         outer = tk.Frame(self.msg_inner, bg=C_PANEL)
         outer.pack(fill='x', padx=8, pady=2)
 
@@ -2158,12 +2000,10 @@ class ChatWindow:
         bubble = tk.Frame(outer, bg=bg, padx=10, pady=6)
         bubble.pack(anchor=align, padx=4)
 
-        # Unread indicator stripe on left edge of incoming bubbles
         if unread and not outgoing:
             stripe = tk.Frame(bubble, bg=C_GREEN, width=3)
             stripe.pack(side='left', fill='y', padx=(0, 6))
 
-        # Group: show sender name
         if not outgoing and msg_type == 'group':
             tk.Label(
                 bubble, text=sender,
@@ -2175,7 +2015,6 @@ class ChatWindow:
             fg=C_TEXT, bg=bg, wraplength=480, justify='left'
         ).pack(anchor='w')
 
-        # ── Bottom row: timestamp + tick ──────────────────────────────────────
         meta = tk.Frame(bubble, bg=bg)
         meta.pack(anchor='e', fill='x')
 
@@ -2190,7 +2029,6 @@ class ChatWindow:
                 fg=tick_col, bg=bg
             )
             tick_lbl.pack(side='left', padx=(4, 0))
-            # Register the tick label so the event handler can update it
             if register_tick:
                 self._tick_labels[self.current_chat] = tick_lbl
 
@@ -2199,38 +2037,24 @@ class ChatWindow:
 
     @staticmethod
     def _tick_appearance(status: str) -> tuple:
-        """
-        pending   → ✓   grey   (sent, server not yet confirmed)
-        delivered → ✓✓  grey   (server confirmed recipient is online & received)
-        queued    → ✓   grey   (recipient offline, message queued)
-        read      → ✓✓  blue   (recipient replied — they've seen it)
-        """
         if status == 'read':
             return '✓✓', C_TICK_BLUE
         if status == 'delivered':
             return '✓✓', C_TICK_GREY
-        # pending / queued / anything else
         return '✓', C_TICK_GREY
 
     def _scroll_to_bottom(self):
         self.msg_canvas.yview_moveto(1.0)
 
     def _update_last_tick(self, chat_id: str, new_status: str):
-        """
-        Update the status of the most recent outgoing message in chat_id
-        and refresh its tick label widget if it's currently visible.
-        """
         msgs = self.conversations.get(chat_id, [])
-        # Walk backwards to find the last outgoing message
         for m in reversed(msgs):
             if m.get('outgoing', False):
                 m['status'] = new_status
-                # Persist the update
                 self.history._data.get('conversations', {}).get(chat_id, [])
                 self.history._save_nolock()
                 break
 
-        # Update the live tick label if the chat is open
         if chat_id == self.current_chat and chat_id in self._tick_labels:
             lbl = self._tick_labels.get(chat_id)
             if lbl and lbl.winfo_exists():
@@ -2242,7 +2066,6 @@ class ChatWindow:
             self.conversations[chat_id] = []
         self.conversations[chat_id].append(msg_dict)
 
-        # Persist to disk
         if msg_dict.get('type') != 'system' or msg_dict.get('content', '').startswith('['):
             self.history.append(chat_id, msg_dict)
 
@@ -2250,41 +2073,31 @@ class ChatWindow:
         is_active   = (self.current_chat == chat_id)
 
         if is_incoming and not is_active:
-            # Increment unread count for background chats
             self.unread_counts[chat_id] = self.unread_counts.get(chat_id, 0) + 1
             self._update_chat_list()
         elif is_active and hasattr(self, 'msg_inner'):
-            # Render into the open chat
             is_last_out = msg_dict.get('outgoing', False)
             self._render_bubble(msg_dict, register_tick=is_last_out)
             self._update_chat_list()
         else:
             self._update_chat_list()
 
-    # ── Icon helpers ──────────────────────────────────────────────────────────
-
     @staticmethod
     def _draw_avatar(canvas, cx, cy, is_group: bool, active: bool):
-        """Draw a classic person or group silhouette icon inside a circle."""
         r = 20
         bg = C_ACCENT if is_group else "#1E3A5F"
-        # Circle background
         canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
                            fill=bg, outline='')
         fg = C_TEXT
         if is_group:
-            # Two person heads (offset left & right)
             for dx, layer in [(-5, 0), (5, 1)]:
                 hx = cx + dx
-                # head
                 canvas.create_oval(hx - 5, cy - 14, hx + 5, cy - 4,
                                    fill=fg, outline='')
-                # body arc
                 canvas.create_arc(hx - 9, cy - 6, hx + 9, cy + 10,
                                   start=0, extent=180,
                                   fill=fg, outline='', style='chord')
         else:
-            # Single person
             canvas.create_oval(cx - 6, cy - 14, cx + 6, cy - 2,
                                fill=fg, outline='')
             canvas.create_arc(cx - 11, cy - 4, cx + 11, cy + 12,
@@ -2294,7 +2107,6 @@ class ChatWindow:
     def _update_chat_list(self, filter_text=''):
         if not hasattr(self, "_cl_inner"):
             return
-        # Destroy old rows
         for w in self._cl_inner.winfo_children():
             w.destroy()
 
@@ -2318,17 +2130,14 @@ class ChatWindow:
             is_active = (chat_id == self.current_chat)
             row_bg   = C_HOVER if is_active else C_SIDEBAR
 
-            # ── Row frame ──
             row = tk.Frame(self._cl_inner, bg=row_bg, cursor='hand2')
             row.pack(fill='x')
 
-            # Icon canvas
             ic = tk.Canvas(row, width=52, height=64,
                            bg=row_bg, highlightthickness=0)
             ic.pack(side='left', padx=(8, 4))
             self._draw_avatar(ic, 26, 32, is_group, is_active)
 
-            # Text block
             txt = tk.Frame(row, bg=row_bg)
             txt.pack(side='left', fill='both', expand=True, pady=10, padx=(0, 8))
 
@@ -2352,10 +2161,8 @@ class ChatWindow:
                      anchor='w', wraplength=300, justify='left'
                      ).pack(fill='x', anchor='w')
 
-            # Divider
             tk.Frame(self._cl_inner, bg=C_BORDER, height=1).pack(fill='x', padx=12)
 
-            # Bind clicks on every child widget in the row
             def _select(e=None, cid=chat_id):
                 self._open_chat(cid)
             for widget in (row, ic, txt, top_row):
@@ -2380,17 +2187,12 @@ class ChatWindow:
             self._update_chat_list()
             self._build_chat_right(chat_id)
 
-    def _on_chat_select(self, _event=None):
-        pass  # no longer used — canvas rows call _open_chat directly
-
     def _filter_chats(self, *_):
         txt = self.search_var.get()
         if txt.startswith("🔍"):
             self._update_chat_list('')
         else:
             self._update_chat_list(txt)
-
-    # ─────────────────  SEND  ─────────────────────────────────────────────────
 
     def _send_message(self):
         if not self.current_chat: return
@@ -2437,8 +2239,6 @@ class ChatWindow:
         self.net.send_file(self.current_chat, fp)
         self._show_status(f"📤 Sending {os.path.basename(fp)}…")
 
-    # ─────────────────  VOICE NOTES  ──────────────────────────────────────────
-
     def _start_voice_recording(self):
         if not self.current_chat:
             return
@@ -2471,11 +2271,8 @@ class ChatWindow:
             'voice_dur':  duration,
         }
         self._append_message(chat_id, msg)
-        # Send as audio file attachment
         self.net.send_file(chat_id, path)
         self._show_status(f"📤 Sending voice note ({duration}s)…")
-
-    # ─────────────────  CALLS  ────────────────────────────────────────────────
 
     def _start_call(self, call_type: str):
         if not self.current_chat:
@@ -2497,8 +2294,6 @@ class ChatWindow:
 
     def _call_ended_cleanup(self):
         self.active_call_window = None
-
-    # ─────────────────  MENUS  ────────────────────────────────────────────────
 
     def _new_chat_menu(self):
         menu = tk.Menu(self.root, tearoff=0, bg=C_HEADER, fg=C_TEXT,
@@ -2560,8 +2355,6 @@ class ChatWindow:
         if not name:
             return
 
-        # Check locally — groups the user is a member of are always tracked
-        # in known_groups / conversations. No server round-trip needed.
         if name not in self.known_groups and name not in self.conversations:
             messagebox.showerror(
                 "Group Not Found",
@@ -2571,7 +2364,6 @@ class ChatWindow:
             )
             return
 
-        # Group is valid — add to sidebar if not already there and open it
         self.known_groups.add(name)
         self.history.mark_group(name)
         if name not in self.conversations:
@@ -2604,26 +2396,20 @@ class ChatWindow:
             self.net.disconnect()
             self.root.destroy()
 
-    # ─────────────────  STATUS BAR  ───────────────────────────────────────────
-
     def _show_status(self, text: str):
         if hasattr(self, 'chat_status_lbl'):
             self.chat_status_lbl.config(text=text)
             self.root.after(5000, lambda: self.chat_status_lbl.config(text='')
                             if hasattr(self, 'chat_status_lbl') else None)
 
-    # ─────────────────  EVENT LOOP  ───────────────────────────────────────────
-
     def _start_event_loop(self):
         self.root.after(50, self._process_queue)
 
     def _start_group_purge(self):
-        """Queue all persisted groups for sequential server verification."""
         self._groups_to_verify = list(self.known_groups)
         self._advance_group_purge()
 
     def _advance_group_purge(self):
-        """Send the next verify probe, or finish if the queue is empty."""
         if not self._groups_to_verify:
             self._verifying_group = None
             return
@@ -2645,7 +2431,6 @@ class ChatWindow:
         if etype == 'MESSAGE':
             _, raw_msg, msg_type = event
 
-            # ── Absorb / reroute server control responses ──────────────────────
             _SILENT = {
                 "GROUP CREATED", "GROUP EXISTS", "LEFT GROUP",
                 "GROUP NOT FOUND OR NOT MEMBER",
@@ -2655,7 +2440,6 @@ class ChatWindow:
                 "ERROR:", "GROUP CREATED", "GROUP EXISTS",
             )
 
-            # Delivery confirmations → update tick on last sent message
             if raw_msg == "DELIVERED" and self.current_chat:
                 self._update_last_tick(self.current_chat, 'delivered')
                 return
@@ -2667,7 +2451,6 @@ class ChatWindow:
             if raw_msg in _SILENT:
                 return
             if any(raw_msg.startswith(p) for p in _STATUS_PREFIXES):
-                # Startup purge: group confirmed valid — move to next
                 if raw_msg.startswith("ADD_STATUS:") and self._verifying_group:
                     self._verifying_group = None
                     self._advance_group_purge()
@@ -2679,12 +2462,8 @@ class ChatWindow:
 
             if parsed['type'] == 'dm':
                 sender = parsed['sender']
-                # Server sends SYSTEM DMs for group join/leave/add notifications.
-                # Render them as a notification pill in the relevant group chat
-                # (or the status bar) — never create a SYSTEM sidebar entry.
                 if sender == 'SYSTEM':
                     content = parsed.get('content', '')
-                    # Try to match the notification to an open group by name
                     target = next(
                         (g for g in self.known_groups if g in content),
                         self.current_chat if self._is_group_chat(self.current_chat or '') else None
@@ -2700,19 +2479,15 @@ class ChatWindow:
                 parsed['unread'] = (sender != self.username and
                                     self.current_chat != sender)
                 self._append_message(sender, {**parsed, 'outgoing': False})
-                # Their reply means they read our last message → blue ticks
                 self._update_last_tick(sender, 'read')
 
             elif parsed['type'] == 'group':
                 group = parsed['group']
                 self.known_groups.add(group)
-                # Server echoes our own group messages back to us — skip them
-                # since _send_message already rendered them as outgoing bubbles.
                 if parsed.get('sender') == self.username:
                     return
                 parsed['unread'] = (self.current_chat != group)
                 self._append_message(group, {**parsed, 'outgoing': False})
-                # Reply in group → mark our last msg read
                 self._update_last_tick(group, 'read')
 
             else:
@@ -2726,7 +2501,6 @@ class ChatWindow:
             self._show_status(event[1])
 
         elif etype == 'GROUP_NOT_FOUND':
-            # ── Startup purge: silently remove the stale group ────────────────
             if self._verifying_group:
                 stale = self._verifying_group
                 self._verifying_group = None
@@ -2736,8 +2510,7 @@ class ChatWindow:
                 self._update_chat_list()
                 self._advance_group_purge()
                 return
-            # ── Manual open-group dialog: show error, don't open chat ─────────
-            if self._pending_group_open:
+            if getattr(self, '_pending_group_open', None):
                 messagebox.showerror(
                     "Group Not Found",
                     f"'{self._pending_group_open}' does not exist or you are not a member.\n"
@@ -2757,24 +2530,20 @@ class ChatWindow:
 
             def on_reject():
                 self.net.reject_call(caller)
-                # Release the listener so it can watch for future calls
                 self.net.call_manager.end_call()
 
             IncomingCallDialog(self.root, caller, call_type, on_accept, on_reject)
 
-        # UDP listener detected incoming audio/video before TCP signal arrived
         elif etype == 'INCOMING_CALL_UDP':
-            pass   # handled when TCP INCOMING_CALL arrives shortly after
+            pass   
 
         elif etype == 'CALL_RINGING':
             _, peer = event
             self._show_status(f"📞 Ringing {peer}…")
-            # Call window opened after acceptance
 
         elif etype == 'CALL_ACCEPTED':
             _, callee = event
             self._show_status(f"✅ {callee} accepted!")
-            # Open call window now
             if not self.active_call_window:
                 ctype = self.net.current_call_type or 'audio'
                 self._open_call_window(callee, ctype)
@@ -2798,7 +2567,6 @@ class ChatWindow:
             _, filename, recipient = event
             self._show_status(f"✅ '{filename}' sent to {recipient}")
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             note = {
                 'type':     'system',
@@ -2810,15 +2578,11 @@ class ChatWindow:
             self._append_message(self.username, note)
 
         elif etype == 'FILE_RECEIVED':
-            # Unpack — sender is optional (older protocol omits it)
             _, filename, ftype, save_path = event[:4]
             sender = event[4] if len(event) > 4 else None
-
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # ── Voice note ────────────────────────────────────────────────────
             if filename.startswith('c00n_voice_') and filename.endswith('.wav'):
-                # Try to get duration from the WAV file
                 dur = 0.0
                 try:
                     with _wave.open(save_path, 'rb') as wf:
@@ -2826,7 +2590,6 @@ class ChatWindow:
                 except Exception:
                     pass
 
-                # Figure out which chat this belongs to
                 chat_id = sender or self.current_chat
                 if not chat_id:
                     self._show_status(f"📥 Voice note saved: {save_path}")
@@ -2845,7 +2608,6 @@ class ChatWindow:
                 self._append_message(chat_id, msg)
                 return
 
-            # ── Regular file ──────────────────────────────────────────────────
             self._show_status(f"📥 Received: {filename}")
             note = {
                 'type':    'system',
@@ -2879,12 +2641,9 @@ class App:
     def __init__(self):
         self.root      = tk.Tk()
         self.root.title("C00NECTED")
-        #self.root.geometry("960x640")
         self.root.configure(bg=C_BG)
         self.root.minsize(980, 640)
 
-        # Centre on screen
-        #self.root.update_idletasks()
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         w = max(1200, int(sw * 0.80))
@@ -2896,10 +2655,8 @@ class App:
         self.gui_queue = queue.Queue()
         self.net = NetworkClient(self.gui_queue)
 
-        # Try connecting to server immediately (non-blocking)
         connected = self.net.connect()
 
-        # Splash → Auth
         if connected:
             SplashScreen(self.root, self._show_auth)
         else:
@@ -2939,8 +2696,6 @@ class App:
     def run(self):
         self.root.mainloop()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     App().run()
