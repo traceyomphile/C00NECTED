@@ -447,12 +447,18 @@ class CallManager:
 
     def accept_incoming_call(self, call_type: str = 'audio'):
         if not self.incoming_caller_addr:
+            self.gui_queue(('STATUS', 'Call accept failed: no caller address'))
             return False
 
         self._begin_call(call_type)
         self.peer_addr = self.incoming_caller_addr
 
+        # Start UDP dispatcher first
+        #self._start_udp_dispatcher()
+
+        # Send punch ACK to open our NAT to them
         self.udp_sock.sendto(b'PUNCH_ACK', self.peer_addr)
+
         self._start_media_threads(call_type)
         return True
 
@@ -482,6 +488,45 @@ class CallManager:
         while not self.video_frame_queue.empty():
             try: self.video_frame_queue.get_nowait()
             except: break
+        
+        self._call_done_event.set()     # let the listener resume
+
+    # ── Background listener ───────────────────────────────────────────────────
+
+    def listen_for_incoming(self):
+        """
+        Runs forever as a daemon thread.
+        - While no call is active: reads packets and detects new calls.
+        - While a call is active: blocks on _call_done_event (doesn't touch
+          the socket so call threads have exclusive access).
+        """
+        self.udp_sock.settimeout(1.0)
+        while True:
+            # Block here while a call is active — dispatcher owns the socket
+            self._call_done_event.wait()
+
+            try:
+                datagram, addr = self.udp_sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+            if not datagram:
+                continue
+
+            if datagram == b'PUNCH':
+                self.udp_sock.sendto(b'PUNCH_ACK', addr)
+
+            pkt = datagram[0:1]
+            if pkt not in (PKT_AUDIO, PKT_VIDEO):
+                continue
+
+            # First meaningful packet from a caller — notify the GUI
+            self.incoming_caller_addr = addr
+            self._call_done_event.clear()   # pause listener until call ends
+            self.gui_queue.put(('INCOMING_CALL_UDP',))
+            # Listener is now paused; call threads will take over the socket
 
     # ── Audio threads ─────────────────────────────────────────────────────────
 
