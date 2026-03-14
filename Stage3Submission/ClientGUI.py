@@ -753,6 +753,13 @@ class NetworkClient:
     def leave_group(self, group_name: str):
         send_framed_msg(self.tcp_sock, f"LEAVE_GROUP:{group_name}:", 'C')
 
+    def verify_group(self, group_name: str):
+        """Probe the server to check whether this client is a member of group_name.
+        The server responds with ADD_STATUS:... (member/exists) or
+        GROUP NOT FOUND OR NOT MEMBER (doesn't exist / not a member).
+        """
+        send_framed_msg(self.tcp_sock, f"ADD_TO_GROUP:{group_name}:{self.username}", 'C')
+
     # ── Calls ─────────────────────────────────────────────────────────────────
 
     def request_call(self, recipient: str, call_type: str):
@@ -871,17 +878,10 @@ class NetworkClient:
                     self.gui_queue.put(('INCOMING_CALL', caller, call_type))
                     continue
 
-                # ----- Delivery / Status / Control messages -----
-                if msg =="DELIVERED" and self.current_chat:
-                    pass
-
-                if msg.startswith("USER OFFLINE"):
-                    if self.current_chat:
-                        self.gui_queue.put(('STATUS', msg))
+                if msg in {'GROUP CREATED', 'GROUP EXISTS', 'LEFT GROUP'}:
                     continue
-
-                if msg in {'GROUP CREATED', 'GROUP EXISTS', 'LEFT GROUP',
-                           'GROUP NOT FOUND OR NOT MEMBER'}:
+                if msg == 'GROUP NOT FOUND OR NOT MEMBER':
+                    self.gui_queue.put(('GROUP_NOT_FOUND',))
                     continue
 
                 if msg.startswith(("ADD_STATUS:", "CALLING:", "MEDIA_ID:",
@@ -1663,6 +1663,8 @@ class ChatWindow:
         self.current_chat: str | None       = None
         self.active_call_window: CallWindow | None = None
         self._pending_call_info: tuple | None   = None
+        self._groups_to_verify:   list          = []    # startup purge queue
+        self._verifying_group:    str | None    = None  # group currently being probed on startup
 
         # Unread message counts per chat (not persisted — reset on login)
         self.unread_counts: dict[str, int]  = {}
@@ -1672,10 +1674,18 @@ class ChatWindow:
         self._voice_rec   = VoiceRecorder()
         self._is_recording = False
 
+        # Scrub any SYSTEM pseudo-conversation persisted by the old bug
+        if 'SYSTEM' in self.conversations:
+            del self.conversations['SYSTEM']
+            self.history.delete_chat('SYSTEM')
+
         self._clear_root()
         self._build_layout()
         self._update_chat_list()   # populate sidebar from restored history
         self._start_event_loop()
+        # Kick off sequential server-side verification of all persisted groups
+        # so any stale ones are silently removed from the sidebar on login.
+        self.root.after(200, self._start_group_purge)
 
     def _clear_root(self):
         for w in self.root.winfo_children():
@@ -1742,7 +1752,7 @@ class ChatWindow:
         sf = tk.Frame(self.sidebar, bg=C_SIDEBAR, pady=8, padx=10)
         sf.pack(fill='x')
         self.search_var = tk.StringVar()
-        self.search_var.trace('w', self._filter_chats)
+        self.search_var.trace_add('write', self._filter_chats)
         s_entry = tk.Entry(sf, textvariable=self.search_var,
                            bg=C_INPUT_BG, fg=C_TEXT, insertbackground=C_TEXT,
                            relief='flat', font=FONT_APP, bd=0)
@@ -1987,6 +1997,24 @@ class ChatWindow:
             or (msg_type == 'dm'   and sender == 'SYSTEM')
         )
         if is_notification:
+            # Outgoing system notes (e.g. file sent) → right-aligned styled bubble
+            if outgoing:
+                outer = tk.Frame(self.msg_inner, bg=C_PANEL)
+                outer.pack(fill='x', padx=8, pady=2)
+                bubble = tk.Frame(outer, bg=C_SENT, padx=10, pady=6)
+                bubble.pack(anchor='e', padx=4)
+                tk.Label(
+                    bubble, text=content, font=FONT_APP,
+                    fg=C_TEXT, bg=C_SENT, wraplength=480, justify='left'
+                ).pack(anchor='w')
+                meta = tk.Frame(bubble, bg=C_SENT)
+                meta.pack(anchor='e')
+                tk.Label(meta, text=ts.split(' ')[1] if ' ' in ts else ts,
+                         font=FONT_MICRO, fg=C_SECONDARY, bg=C_SENT).pack(side='left')
+                self.msg_canvas.update_idletasks()
+                self._scroll_to_bottom()
+                return
+            # Incoming / server notifications → centered pill
             pill_frame = tk.Frame(self.msg_inner, bg=C_PANEL)
             pill_frame.pack(fill='x', pady=6)
             pill = tk.Frame(pill_frame, bg='#1A3040', padx=14, pady=5)
@@ -2251,12 +2279,16 @@ class ChatWindow:
                               fill=fg, outline='', style='chord')
 
     def _update_chat_list(self, filter_text=''):
+        if not hasattr(self, "_cl_inner"):
+            return
         # Destroy old rows
         for w in self._cl_inner.winfo_children():
             w.destroy()
 
         ft = filter_text.lower().strip()
         for chat_id in sorted(self.conversations.keys()):
+            if chat_id == 'SYSTEM':
+                continue
             if ft and ft not in chat_id.lower():
                 continue
 
@@ -2510,17 +2542,33 @@ class ChatWindow:
 
     def _open_group_dialog(self):
         name = simpledialog.askstring("Open Group",
-                                      "Enter group name to join/view:", parent=self.root)
-        if name:
-            name = name.strip()
-            self.known_groups.add(name)
-            self.history.mark_group(name)
-            if name not in self.conversations:
-                self.conversations[name] = []
-                self.history.ensure_chat(name)
-                self._update_chat_list()
-            self.current_chat = name
-            self._build_chat_right(name)
+                                      "Enter group name to open:", parent=self.root)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+
+        # Check locally — groups the user is a member of are always tracked
+        # in known_groups / conversations. No server round-trip needed.
+        if name not in self.known_groups and name not in self.conversations:
+            messagebox.showerror(
+                "Group Not Found",
+                f"'{name}' does not exist or you are not a member.\n"
+                "Ask the group admin to add you.",
+                parent=self.root
+            )
+            return
+
+        # Group is valid — add to sidebar if not already there and open it
+        self.known_groups.add(name)
+        self.history.mark_group(name)
+        if name not in self.conversations:
+            self.conversations[name] = []
+            self.history.ensure_chat(name)
+        self._update_chat_list()
+        self.current_chat = name
+        self._build_chat_right(name)
 
     def _add_member_dialog(self):
         if not self.current_chat: return
@@ -2557,6 +2605,19 @@ class ChatWindow:
 
     def _start_event_loop(self):
         self.root.after(50, self._process_queue)
+
+    def _start_group_purge(self):
+        """Queue all persisted groups for sequential server verification."""
+        self._groups_to_verify = list(self.known_groups)
+        self._advance_group_purge()
+
+    def _advance_group_purge(self):
+        """Send the next verify probe, or finish if the queue is empty."""
+        if not self._groups_to_verify:
+            self._verifying_group = None
+            return
+        self._verifying_group = self._groups_to_verify.pop(0)
+        self.net.verify_group(self._verifying_group)
 
     def _process_queue(self):
         try:
@@ -2595,6 +2656,11 @@ class ChatWindow:
             if raw_msg in _SILENT:
                 return
             if any(raw_msg.startswith(p) for p in _STATUS_PREFIXES):
+                # Startup purge: group confirmed valid — move to next
+                if raw_msg.startswith("ADD_STATUS:") and self._verifying_group:
+                    self._verifying_group = None
+                    self._advance_group_purge()
+                    return
                 self._show_status(raw_msg)
                 return
 
@@ -2602,6 +2668,24 @@ class ChatWindow:
 
             if parsed['type'] == 'dm':
                 sender = parsed['sender']
+                # Server sends SYSTEM DMs for group join/leave/add notifications.
+                # Render them as a notification pill in the relevant group chat
+                # (or the status bar) — never create a SYSTEM sidebar entry.
+                if sender == 'SYSTEM':
+                    content = parsed.get('content', '')
+                    # Try to match the notification to an open group by name
+                    target = next(
+                        (g for g in self.known_groups if g in content),
+                        self.current_chat if self._is_group_chat(self.current_chat or '') else None
+                    )
+                    if target:
+                        self._append_message(target, {
+                            'type': 'system', 'content': content,
+                            'sender': 'SYSTEM', 'outgoing': False
+                        })
+                    else:
+                        self._show_status(content)
+                    return
                 parsed['unread'] = (sender != self.username and
                                     self.current_chat != sender)
                 self._append_message(sender, {**parsed, 'outgoing': False})
@@ -2611,12 +2695,14 @@ class ChatWindow:
             elif parsed['type'] == 'group':
                 group = parsed['group']
                 self.known_groups.add(group)
-                parsed['unread'] = (parsed.get('sender') != self.username and
-                                    self.current_chat != group)
+                # Server echoes our own group messages back to us — skip them
+                # since _send_message already rendered them as outgoing bubbles.
+                if parsed.get('sender') == self.username:
+                    return
+                parsed['unread'] = (self.current_chat != group)
                 self._append_message(group, {**parsed, 'outgoing': False})
                 # Reply in group → mark our last msg read
-                if parsed.get('sender') != self.username:
-                    self._update_last_tick(group, 'read')
+                self._update_last_tick(group, 'read')
 
             else:
                 content = parsed.get('content', raw_msg)
@@ -2627,6 +2713,27 @@ class ChatWindow:
 
         elif etype == 'STATUS':
             self._show_status(event[1])
+
+        elif etype == 'GROUP_NOT_FOUND':
+            # ── Startup purge: silently remove the stale group ────────────────
+            if self._verifying_group:
+                stale = self._verifying_group
+                self._verifying_group = None
+                self.known_groups.discard(stale)
+                self.conversations.pop(stale, None)
+                self.history.delete_chat(stale)
+                self._update_chat_list()
+                self._advance_group_purge()
+                return
+            # ── Manual open-group dialog: show error, don't open chat ─────────
+            if self._pending_group_open:
+                messagebox.showerror(
+                    "Group Not Found",
+                    f"'{self._pending_group_open}' does not exist or you are not a member.\n"
+                    "Ask the group admin to add you.",
+                    parent=self.root
+                )
+                self._pending_group_open = None
 
         elif etype == 'INCOMING_CALL':
             _, caller, call_type = event
@@ -2679,6 +2786,15 @@ class ChatWindow:
         elif etype == 'FILE_SENT':
             _, filename, recipient = event
             self._show_status(f"✅ '{filename}' sent to {recipient}")
+            from datetime import datetime
+            note = {
+                'type':     'system',
+                'content':  f"📎 Sent file: {filename}",
+                'timestamp': ts,
+                'outgoing': True,
+                'status': 'pending'
+            }
+            self._append_message(self.username, note)
 
         elif etype == 'FILE_RECEIVED':
             # Unpack — sender is optional (older protocol omits it)
@@ -2722,7 +2838,7 @@ class ChatWindow:
             self._show_status(f"📥 Received: {filename}")
             note = {
                 'type':    'system',
-                'content': f"📎 {filename}  →  {save_path}",
+                'content': f"📎 '{filename}' received  →  {save_path}",
             }
             target_chat = sender or self.current_chat
             if target_chat:
@@ -2767,7 +2883,7 @@ class App:
         self.root.geometry(f"{w}x{h}+{x}+{y}")
 
         self.gui_queue = queue.Queue()
-        self.net       = NetworkClient(self.gui_queue)
+        self.net = NetworkClient(self.gui_queue)
 
         # Try connecting to server immediately (non-blocking)
         connected = self.net.connect()
