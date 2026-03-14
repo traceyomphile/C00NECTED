@@ -55,27 +55,27 @@ PDF_EXTS   = {'.pdf'}
 # COLORS & FONTS  — deep navy blue theme
 # ─────────────────────────────────────────────────────────────────────────────
 
-C_BG        = "#060D1A"   
-C_SIDEBAR   = "#08142A"   
-C_PANEL     = "#0B1A2F"   
-C_HEADER    = "#0D2040"   
-C_SENT      = "#0F2F6E"   
-C_RECV      = "#0A1A30"   
-C_INPUT_BG  = "#091525"   
-C_INPUT_BAR = "#0F2440"   
-C_ACCENT    = "#2563EB"   
-C_ACCENT_LT = "#3B82F6"   
-C_GREEN     = "#2563EB"   
+C_BG        = "#060D1A"   # near-black navy
+C_SIDEBAR   = "#08142A"   # sidebar panel
+C_PANEL     = "#0B1A2F"   # chat panel
+C_HEADER    = "#0D2040"   # header bars
+C_SENT      = "#0F2F6E"   # outgoing message bubble
+C_RECV      = "#0A1A30"   # incoming message bubble
+C_INPUT_BG  = "#091525"   # input field bg
+C_INPUT_BAR = "#0F2440"   # Distinct input bar at bottom
+C_ACCENT    = "#2563EB"   # primary blue accent
+C_ACCENT_LT = "#3B82F6"   # lighter blue (hover/active)
+C_GREEN     = "#2563EB"   # kept as alias so existing refs work
 C_GREEN_LT  = "#3B82F6"
-C_TEXT      = "#F0F4FF"   
-C_SECONDARY = "#7B8FA6"   
-C_HOVER     = "#12284A"   
-C_BORDER    = "#1E3A5F"   
-C_RED       = "#EF4444"   
-C_AMBER     = "#F59E0B"   
-C_ONLINE    = "#22C55E"   
-C_TICK_GREY = "#7B8FA6"   
-C_TICK_BLUE = "#60A5FA"   
+C_TEXT      = "#F0F4FF"   # primary text
+C_SECONDARY = "#7B8FA6"   # muted/placeholder text
+C_HOVER     = "#12284A"   # hover backgrounds
+C_BORDER    = "#1E3A5F"   # dividers / borders
+C_RED       = "#EF4444"   # error / danger
+C_AMBER     = "#F59E0B"   # warnings
+C_ONLINE    = "#22C55E"   # online presence dot
+C_TICK_GREY = "#7B8FA6"   # delivered (grey) ticks
+C_TICK_BLUE = "#60A5FA"   # read (blue) ticks
 
 FONT_APP    = ("Segoe UI", 10)
 FONT_BOLD   = ("Segoe UI", 10, "bold")
@@ -85,6 +85,7 @@ FONT_LARGE  = ("Segoe UI", 14, "bold")
 FONT_LOGO   = ("Consolas", 36, "bold")
 FONT_SUB    = ("Segoe UI", 11)
 
+# Consistent window dimensions
 WINDOW_WIDTH = 1100
 WINDOW_HEIGHT = 720
 
@@ -122,12 +123,18 @@ def receive_framed_msg(sock: socket.socket):
     return msg_type, data.decode('ascii', errors='replace')
 
 def parse_incoming_message(msg: str, my_username: str):
+    """
+    Parse a timestamped server message into structured data.
+    Returns dict with keys: type, sender, content, group, timestamp, raw
+    """
+    # Group message: [ts] [group_id] sender: content
     gm = re.match(r'^\[(.+?)\] \[(.+?)\] (.+?): (.+)$', msg)
     if gm:
         ts, group, sender, content = gm.groups()
         return {'type': 'group', 'timestamp': ts, 'group': group,
                 'sender': sender, 'content': content, 'raw': msg}
 
+    # DM: [ts] [sender (DM)]: content
     dm = re.match(r'^\[(.+?)\] \[(.+?) \(DM\)\]: (.+)$', msg)
     if dm:
         ts, sender, content = dm.groups()
@@ -138,10 +145,17 @@ def parse_incoming_message(msg: str, my_username: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MESSAGE HISTORY 
+# MESSAGE HISTORY  — persists per-user across sessions
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HistoryStore:
+    """
+    Saves and loads chat history as a JSON file per user.
+    File: chat_history/<username>.json
+    Format: { chat_id: [msg_dict, ...], ... }
+    Also persists which chat_ids are known groups.
+    """
+
     HISTORY_DIR = "chat_history"
 
     def __init__(self, username: str):
@@ -150,6 +164,8 @@ class HistoryStore:
         self._path = os.path.join(self.HISTORY_DIR, f"{username}.json")
         self._lock = threading.Lock()
         self._data = self._load()
+
+    # ── Public API ────────────────────────────────────────────────────────────
 
     @property
     def conversations(self) -> dict:
@@ -160,12 +176,14 @@ class HistoryStore:
         return set(self._data.get('known_groups', []))
 
     def append(self, chat_id: str, msg: dict):
+        """Append one message dict and persist immediately."""
         with self._lock:
             convs = self._data.setdefault('conversations', {})
             convs.setdefault(chat_id, []).append(msg)
             self._save_nolock()
 
     def mark_group(self, chat_id: str):
+        """Record that chat_id is a group."""
         with self._lock:
             groups = self._data.setdefault('known_groups', [])
             if chat_id not in groups:
@@ -173,6 +191,7 @@ class HistoryStore:
                 self._save_nolock()
 
     def ensure_chat(self, chat_id: str):
+        """Create an empty conversation slot if it doesn't exist."""
         with self._lock:
             self._data.setdefault('conversations', {}).setdefault(chat_id, [])
             self._save_nolock()
@@ -185,6 +204,8 @@ class HistoryStore:
             except ValueError:
                 pass
             self._save_nolock()
+
+    # ── Internal ──────────────────────────────────────────────────────────────
 
     def _load(self) -> dict:
         try:
@@ -201,10 +222,20 @@ class HistoryStore:
             pass
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VOICE RECORDER 
+# VOICE RECORDER  — record mic → WAV file, playback WAV
 # ─────────────────────────────────────────────────────────────────────────────
 
 class VoiceRecorder:
+    """
+    Records microphone input to a temporary WAV file.
+    Usage:
+        vr = VoiceRecorder()
+        vr.start()
+        ...
+        path, duration = vr.stop()   # returns (filepath, seconds)
+        vr.play(path)                # non-blocking playback in thread
+    """
+
     RATE     = 44100
     CHANNELS = 1
     FORMAT   = pyaudio.paInt16
@@ -237,6 +268,7 @@ class VoiceRecorder:
         return (None, pyaudio.paContinue)
 
     def stop(self) -> tuple:
+        """Stop recording, write WAV, return (path, duration_seconds)."""
         if not self._recording:
             return None, 0
         self._recording = False
@@ -262,6 +294,7 @@ class VoiceRecorder:
 
     @staticmethod
     def play(path: str):
+        """Play a WAV file in a daemon thread (non-blocking)."""
         def _play():
             pa = pyaudio.PyAudio()
             try:
@@ -291,23 +324,33 @@ class VoiceRecorder:
             pass
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CALL MANAGER 
+# CALL MANAGER  — safe Queue-based UDP dispatcher
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CallManager:
+    """
+    Manages real-time UDP audio/video calls using the Dispatcher Pattern.
+    Only ONE thread ever reads from the UDP socket to prevent packet stealing.
+    Packets are safely sorted into Queues for playback threads.
+    """
+
     def __init__(self, gui_queue: queue.Queue):
-        self.gui_queue              = gui_queue
+        self.gui_queue = gui_queue
         self.udp_sock: socket.socket | None = None
-        self.peer_addr: tuple | None        = None
-        self.call_ended             = True
-        self.call_type              = 'audio'
+        self.peer_addr: tuple | None = None
+        self.call_ended = True
+        self.call_type = 'audio'
         self.incoming_caller_addr: tuple | None = None
         
-        self.video_frame_queue      = queue.Queue(maxsize=3)
-        self._audio_queue           = queue.Queue(maxsize=50)
-        self._video_queue           = queue.Queue(maxsize=50)
+        # Thread-safe queues for media
+        self.video_frame_queue = queue.Queue(maxsize=3)
+        self._audio_queue = queue.Queue(maxsize=50)
+        self._video_queue = queue.Queue(maxsize=50)
         
-        self._hole_punched          = threading.Event()
+        self._call_done_event = threading.Event()
+        self._hole_punched = threading.Event()
+
+    # ── Socket setup ──────────────────────────────────────────────────────────
 
     def create_udp_socket(self) -> int:
         if self.udp_sock:
@@ -321,10 +364,14 @@ class CallManager:
 
         return self.udp_sock.getsockname()[1]
 
+    # ── Safe UDP Dispatcher Thread ────────────────────────────────────────────
+
     def start_dispatcher(self):
+        """Starts the single central reader thread for all UDP packets."""
         threading.Thread(target=self._udp_dispatch_loop, daemon=True).start()
 
     def _udp_dispatch_loop(self):
+        """Central UDP packet mailroom. It reads ALL packets and sorts them."""
         self.udp_sock.settimeout(1.0)
         while True:
             try:
@@ -344,11 +391,18 @@ class CallManager:
             pkt_type = datagram[0:1]
 
             if self.call_ended:
+                # If we are not in a call, watch for incoming call packets
                 if pkt_type in (PKT_AUDIO, PKT_VIDEO):
                     if self.incoming_caller_addr != addr:
                         self.incoming_caller_addr = addr
+                        # Let the GUI know an incoming UDP call arrived
                         self.gui_queue.put(("INCOMING_CALL_UDP",))
             else:
+                # We are in a call: Sort packets into their specific playback queues.
+                # IMPORTANT: Only process packets from the current call peer to prevent
+                # stale PKT_END packets from a previous call ending the new call.
+                if addr != self.peer_addr:
+                    continue
                 if pkt_type == PKT_AUDIO:
                     if not self._audio_queue.full():
                         self._audio_queue.put_nowait(datagram[1:])
@@ -356,13 +410,12 @@ class CallManager:
                     if not self._video_queue.full():
                         self._video_queue.put_nowait(datagram)
                 elif pkt_type == PKT_END:
-                    if not self.call_ended:
-                        self.call_ended = True
-                        self.gui_queue.put(("CALL_ENDED_REMOTE",))
+                    self.call_ended = True
+                    self.gui_queue.put(("CALL_ENDED_REMOTE",))
 
-    def start_symmetric_call(self, peer_ip: str, peer_udp_port: int, call_type: str = 'audio'):
-        if not self.call_ended: return 
-        
+    # ── Outgoing call (caller side) ───────────────────────────────────────────
+
+    def start_outgoing_call(self, peer_ip: str, peer_udp_port: int, call_type: str = 'audio'):
         self._begin_call(call_type)
         self.peer_addr = (peer_ip, int(peer_udp_port))
 
@@ -391,27 +444,97 @@ class CallManager:
     def _start_media_threads(self, call_type: str):
         threading.Thread(target=self._stream_audio, daemon=True, name='audio-send').start()
         threading.Thread(target=self._recv_audio,   daemon=True, name='audio-recv').start()
+        if call_type == 'video':
+            threading.Thread(target=self._stream_video, daemon=True, name='video-send').start()
+            threading.Thread(target=self._recv_video,   daemon=True, name='video-recv').start()
+
+    # ── Accepting an incoming call (callee side) ──────────────────────────────
+
+    def accept_incoming_call(self, call_type: str = 'audio'):
+        if not self.incoming_caller_addr:
+            self.gui_queue.put(('STATUS', 'Call accept failed: no caller address'))
+            return False
+
+        self._begin_call(call_type)
+        self.peer_addr = self.incoming_caller_addr
+
+        # Start UDP dispatcher first
+        #self._start_udp_dispatcher()
+
+        # Send punch ACK to open our NAT to them
+        self.udp_sock.sendto(b'PUNCH_ACK', self.peer_addr)
+
+        self._start_media_threads(call_type)
+        return True
 
     def _begin_call(self, call_type: str):
         self.call_ended = False
         self.call_type  = call_type
+        self._hole_punched.clear()  # Reset for each new call (fixes callee re-call hole-punch)
+
+    # ── End call ─────────────────────────────────────────────────────────────
 
     def end_call(self):
-        was_active = not self.call_ended
         self.call_ended = True
-        
-        if was_active and self.udp_sock and self.peer_addr:
+        if self.udp_sock and self.peer_addr:
             try: 
                 self.udp_sock.sendto(PKT_END, self.peer_addr)
             except: 
                 pass
-                
         self.peer_addr = None
         self.incoming_caller_addr = None
 
+        # Flush stale packets out of the queues
         while not self._audio_queue.empty():
             try: self._audio_queue.get_nowait()
             except: break
+        while not self._video_queue.empty():
+            try: self._video_queue.get_nowait()
+            except: break
+        while not self.video_frame_queue.empty():
+            try: self.video_frame_queue.get_nowait()
+            except: break
+        
+        self._call_done_event.set()     # let the listener resume
+
+    # ── Background listener ───────────────────────────────────────────────────
+
+    def listen_for_incoming(self):
+        """
+        Runs forever as a daemon thread.
+        - While no call is active: reads packets and detects new calls.
+        - While a call is active: blocks on _call_done_event (doesn't touch
+          the socket so call threads have exclusive access).
+        """
+        self.udp_sock.settimeout(1.0)
+        while True:
+            # Block here while a call is active — dispatcher owns the socket
+            self._call_done_event.wait()
+
+            try:
+                datagram, addr = self.udp_sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+            if not datagram:
+                continue
+
+            if datagram == b'PUNCH':
+                self.udp_sock.sendto(b'PUNCH_ACK', addr)
+
+            pkt = datagram[0:1]
+            if pkt not in (PKT_AUDIO, PKT_VIDEO):
+                continue
+
+            # First meaningful packet from a caller — notify the GUI
+            self.incoming_caller_addr = addr
+            self._call_done_event.clear()   # pause listener until call ends
+            self.gui_queue.put(('INCOMING_CALL_UDP',))
+            # Listener is now paused; call threads will take over the socket
+
+    # ── Audio threads ─────────────────────────────────────────────────────────
 
     def _stream_audio(self):
         pa = pyaudio.PyAudio()
@@ -444,6 +567,7 @@ class CallManager:
             )
             while not self.call_ended:
                 try:
+                    # Safely pull ONLY audio packets from the mailroom queue
                     payload = self._audio_queue.get(timeout=0.5)
                     stream.write(payload)
                 except queue.Empty:
@@ -457,11 +581,56 @@ class CallManager:
                 stream.close()
             pa.terminate()
 
+    # ── Video threads ─────────────────────────────────────────────────────────
+    
+    def _stream_video(self):
+        cap = cv2.VideoCapture(0)
+        try:
+            while not self.call_ended:
+                ret, frame = cap.read()
+                if not ret: break
+
+                small   = cv2.resize(frame, (320, 240))
+                payload = pickle.dumps(small, protocol=4)
+                length  = struct.pack('>I', len(payload))
+
+                if self.peer_addr:
+                    self.udp_sock.sendto(PKT_VIDEO + length + payload, self.peer_addr)
+        except Exception as e:
+            if not self.call_ended:
+                self.gui_queue.put(('STATUS', f'[Call] Video send error: {e}'))
+        finally:
+            cap.release()
+
+    def _recv_video(self):
+        while not self.call_ended:
+            try:
+                # Safely pull ONLY video packets from the mailroom queue
+                datagram = self._video_queue.get(timeout=0.5)
+                if len(datagram) < 5:
+                    continue
+
+                length = struct.unpack('>I', datagram[1:5])[0]
+                payload = datagram[5:5+length]
+                frame = pickle.loads(payload)
+
+                if not self.video_frame_queue.full():
+                    self.video_frame_queue.put_nowait(frame)
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                continue
+
 # ─────────────────────────────────────────────────────────────────────────────
 # NETWORK CLIENT
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NetworkClient:
+    """
+    Handles all TCP communication with the ARCP server.
+    Posts structured events to gui_queue for the main thread to consume.
+    """
 
     def __init__(self, gui_queue: queue.Queue):
         self.gui_queue         = gui_queue
@@ -473,6 +642,8 @@ class NetworkClient:
         self.shutting_down     = False
         self.current_call_type = 'audio'
 
+    # ── Connection ────────────────────────────────────────────────────────────
+
     def connect(self) -> bool:
         try:
             self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -483,6 +654,8 @@ class NetworkClient:
         except Exception as e:
             self.gui_queue.put(('CONNECT_ERROR', str(e)))
             return False
+
+    # ── Auth ──────────────────────────────────────────────────────────────────
 
     def check_user(self, username: str) -> str:
         send_framed_msg(self.tcp_sock, f"CHECK:{username}", 'A')
@@ -500,6 +673,7 @@ class NetworkClient:
         return resp or "ERROR"
 
     def post_auth_setup(self, username: str):
+        """Register ports with server, start all background threads."""
         self.username = username
 
         self.media_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -515,9 +689,13 @@ class NetworkClient:
         threading.Thread(target=self._recv_tcp_media, daemon=True).start()
         threading.Thread(target=self._recv_tcp_messages, daemon=True).start()
         
+        # Start the UDP Dispatcher mailroom
         self.call_manager.start_dispatcher()
 
+        # Deliver any queued offline messages immediately
         send_framed_msg(self.tcp_sock, "FLUSH_OFFLINE:", 'C')
+
+    # ── Messaging ─────────────────────────────────────────────────────────────
 
     def send_dm(self, recipient: str, text: str):
         send_framed_msg(self.tcp_sock, f"SEND:{recipient}:{text}", 'D')
@@ -525,10 +703,14 @@ class NetworkClient:
     def send_group_msg(self, group_id: str, text: str):
         send_framed_msg(self.tcp_sock, f"SEND_GROUP:{group_id}:{text}", 'D')
 
+    # ── File transfer ─────────────────────────────────────────────────────────
+
     def send_file(self, recipient: str, filepath: str):
         filename = os.path.basename(filepath)
         self.pending_transfers[recipient] = filepath
         send_framed_msg(self.tcp_sock, f"GET_PEER:{recipient}:{filename}", 'C')
+
+    # ── Groups ────────────────────────────────────────────────────────────────
 
     def create_group(self, group_name: str):
         send_framed_msg(self.tcp_sock, f"CREATE_GROUP:{group_name}:", 'C')
@@ -540,7 +722,13 @@ class NetworkClient:
         send_framed_msg(self.tcp_sock, f"LEAVE_GROUP:{group_name}:", 'C')
 
     def verify_group(self, group_name: str):
+        """Probe the server to check whether this client is a member of group_name.
+        The server responds with ADD_STATUS:... (member/exists) or
+        GROUP NOT FOUND OR NOT MEMBER (doesn't exist / not a member).
+        """
         send_framed_msg(self.tcp_sock, f"ADD_TO_GROUP:{group_name}:{self.username}", 'C')
+
+    # ── Calls ─────────────────────────────────────────────────────────────────
 
     def request_call(self, recipient: str, call_type: str):
         self.current_call_type = call_type
@@ -554,6 +742,8 @@ class NetworkClient:
 
     def end_call(self):
         self.call_manager.end_call()
+
+    # ── Disconnect ────────────────────────────────────────────────────────────
 
     def disconnect(self):
         self.shutting_down = True
@@ -574,6 +764,8 @@ class NetworkClient:
         except: 
             pass
 
+    # ── Background receive loop ───────────────────────────────────────────────
+
     def _recv_tcp_messages(self):
         while True:
             try:
@@ -583,6 +775,7 @@ class NetworkClient:
                         self.gui_queue.put(('DISCONNECTED', 'Connection lost'))
                     break
 
+                # ── P2P file: single user ──
                 if msg_type == 'C' and msg.startswith("PEER_INFO:"):
                     _, target_user, t_ip, t_port = msg.split(':', 3)
                     if target_user in self.pending_transfers:
@@ -594,6 +787,7 @@ class NetworkClient:
                         ).start()
                     continue
 
+                # ── P2P file: group ──
                 if msg_type == 'C' and msg.startswith("GROUP_PEER_INFO:"):
                     _, group_name, peers_str = msg.split(':', 2)
                     if group_name in self.pending_transfers:
@@ -607,6 +801,7 @@ class NetworkClient:
                             ).start()
                     continue
 
+                # ── Store for offline user ──
                 if msg_type == 'C' and msg.startswith("STORE_OFFLINE:"):
                     target = msg.split(':', 2)[1]
                     fp = self.pending_transfers.get(target)
@@ -618,16 +813,16 @@ class NetworkClient:
                         ).start()
                     continue
 
-                # THE FIX: Tell Caller that the Callee answered, and start the media streams!
+                # ── Call peer info (caller gets callee's UDP addr) ──
+                if msg_type == 'C' and msg.startswith("CALL_PEER_INFO:"):
+                    _, peer_user, peer_ip, peer_udp_port = msg.split(":")
+                    self.call_manager.start_outgoing_call(peer_ip, peer_udp_port, self.current_call_type)
+                    self.gui_queue.put(('CALL_RINGING', peer_user))
+                    continue
+
                 if msg_type == 'C' and msg.startswith("CALL_ACCEPTED:"):
-                    parts = msg.split(":")
-                    callee = parts[1]
-                    if len(parts) >= 4:
-                        callee_ip = parts[2]
-                        callee_port = int(parts[3])
-                        self.call_manager.start_symmetric_call(callee_ip, callee_port, self.current_call_type)
-                    
-                    self.gui_queue.put(('CALL_CONNECTED', callee))
+                    callee = msg.split(":")[1]
+                    self.gui_queue.put(('CALL_ACCEPTED', callee))
                     continue
 
                 if msg_type == 'C' and msg.startswith("CALL_REJECTED:"):
@@ -636,16 +831,12 @@ class NetworkClient:
                     self.gui_queue.put(('CALL_REJECTED', callee))
                     continue
 
-                # THE FIX: Tell the GUI to update the popup to show that it is ringing!
-                if msg_type == 'C' and msg.startswith("CALL_RINGING:"):
-                    self.gui_queue.put(('CALL_RINGING', msg.split(":")[1]))
-                    continue
-
+                # ── Incoming call notification ──
                 if msg.startswith("AUDIO_CALL:") or msg.startswith("VIDEO_CALL:"):
                     parts     = msg.split(":")
                     caller    = parts[1]
                     call_type = "audio" if msg.startswith("AUDIO_CALL:") else "video"
-                    
+                    # Server now includes caller's IP and UDP port in the notification.
                     if len(parts) >= 4:
                         caller_ip       = parts[2]
                         caller_udp_port = int(parts[3])
@@ -670,10 +861,12 @@ class NetworkClient:
                     self.gui_queue.put(('CALL_OFFLINE', msg.split(":", 1)[1]))
                     continue
 
+                # ── Session timeout ──
                 if msg_type == 'C' and msg.startswith("TIMEOUT"):
                     self.gui_queue.put(('TIMEOUT', msg))
                     break
 
+                # ── Offline media notification ──
                 if msg.startswith("MEDIA_WAITING:"):
                     parts = msg.split(":", 3)
                     media_id, sender, filename = parts[1], parts[2], parts[3]
@@ -681,6 +874,7 @@ class NetworkClient:
                     send_framed_msg(self.tcp_sock, f"DOWNLOAD_MEDIA:{media_id}:", 'C')
                     continue
 
+                # ── Base64 file download ──
                 if msg_type == 'D' and msg.startswith("FILE:"):
                     parts = msg.split(":", 4)
                     if len(parts) >= 4:
@@ -691,6 +885,7 @@ class NetworkClient:
                         self._save_b64_file(filename, ftype, b64, sender)
                     continue
 
+                # ── All other messages (DMs, group msgs, system msgs) ──
                 self.gui_queue.put(('MESSAGE', msg, msg_type))
 
             except Exception as e:
@@ -799,11 +994,18 @@ class NetworkClient:
             n += 1
         return path
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SPLASH SCREEN
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SplashScreen:
+    """
+    Full-window splash with the C00NECTED logo.
+    The two '0' characters are replaced by hand-drawn router icons.
+    Shows for 3 seconds then calls on_done().
+    """
+
     def __init__(self, root: tk.Tk, on_done):
         self.root    = root
         self.on_done = on_done
@@ -896,6 +1098,8 @@ class SplashScreen:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AuthWindow:
+    """Login / register — styled to match the deep-navy blue design."""
+
     CARD_W = 400
 
     def __init__(self, root: tk.Tk, net: NetworkClient, on_success):
@@ -1124,10 +1328,16 @@ class AuthWindow:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CALL WINDOW  
+# CALL WINDOW  — shown during an active call
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CallWindow(tk.Toplevel):
+    """
+    Shows during an active call.
+    - Audio call: avatar + timer + mute/end buttons.
+    - Video call: remote video feed + local PiP + controls.
+    """
+
     def __init__(self, root, net: NetworkClient, peer: str, call_type: str, on_end):
         super().__init__(root)
         self.net       = net
@@ -1144,8 +1354,12 @@ class CallWindow(tk.Toplevel):
         self.resizable(False, False)
         self.protocol("WM_DELETE_WINDOW", self._end_call)
 
-        self.geometry("360x420")
-        self._build_audio_ui()
+        if call_type == 'video':
+            self.geometry("700x560")
+            self._build_video_ui()
+        else:
+            self.geometry("360x420")
+            self._build_audio_ui()
 
         self._tick_timer()
 
@@ -1173,6 +1387,31 @@ class CallWindow(tk.Toplevel):
     def update_status(self, text: str):
         if self._running:
             self.status_lbl.config(text=text)
+
+    def _build_video_ui(self):
+        top = tk.Frame(self, bg=C_HEADER, height=30)
+        top.pack(fill='x')
+        tk.Label(top, text=f"🎥  Video Call  ·  {self.peer}",
+                 font=FONT_BOLD, fg=C_SECONDARY, bg=C_HEADER).pack(side='left', padx=14, pady=6)
+        self.timer_lbl = tk.Label(top, text="00:00", font=("Consolas", 11),
+                                  fg=C_TEXT, bg=C_HEADER)
+        self.timer_lbl.pack(side='right', padx=14)
+
+        self.remote_canvas = tk.Canvas(self, width=700, height=440,
+                                       bg='#000', highlightthickness=0)
+        self.remote_canvas.pack()
+        self._no_vid_id = self.remote_canvas.create_text(
+            350, 220, text="Waiting for video…", font=FONT_SUB, fill=C_SECONDARY
+        )
+
+        self.local_canvas = tk.Canvas(self, width=140, height=105,
+                                      bg='#111', highlightthickness=0)
+        self.local_canvas.place(x=545, y=320)
+
+        self._build_controls(self)
+        self._poll_remote_video()
+        if PIL_AVAILABLE:
+            self._capture_local_video()
 
     def _build_controls(self, parent):
         row = tk.Frame(parent, bg=C_HEADER)
@@ -1215,6 +1454,50 @@ class CallWindow(tk.Toplevel):
         m, s = divmod(elapsed, 60)
         self.timer_lbl.config(text=f"{m:02d}:{s:02d}")
         self.after(1000, self._tick_timer)
+
+    def _poll_remote_video(self):
+        if not self._running: return
+        try:
+            frame = self.net.call_manager.video_frame_queue.get_nowait()
+            if PIL_AVAILABLE:
+                img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                img = img.resize((700, 440), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                self.remote_canvas.delete(self._no_vid_id)
+                self.remote_canvas.create_image(0, 0, anchor='nw', image=photo)
+                self.remote_canvas._photo = photo  
+        except queue.Empty:
+            pass
+        self.after(30, self._poll_remote_video)
+
+    def _capture_local_video(self):
+        self._local_cap = cv2.VideoCapture(0)
+        threading.Thread(target=self._local_video_thread, daemon=True).start()
+
+    def _local_video_thread(self):
+        self._local_frames: queue.Queue = queue.Queue(maxsize=2)
+        while self._running:
+            ret, frame = self._local_cap.read()
+            if not ret: 
+                break
+            
+            if not self._local_frames.full():
+                self._local_frames.put_nowait(frame)
+            time.sleep(0.033)
+        self._local_cap.release()
+
+    def poll_local_pip(self):
+        if not self._running or not hasattr(self, '_local_frames'): return
+        try:
+            frame = self._local_frames.get_nowait()
+            img   = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            img   = img.resize((140, 105), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self.local_canvas.create_image(0, 0, anchor='nw', image=photo)
+            self.local_canvas._photo = photo
+        except (queue.Empty, AttributeError):
+            pass
+        self.after(33, self.poll_local_pip)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1273,7 +1556,7 @@ class IncomingCallDialog(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHAT WINDOW  
+# CHAT WINDOW  — main interface
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ChatWindow:
@@ -1459,12 +1742,12 @@ class ChatWindow:
         btn_frame = tk.Frame(hdr, bg=C_HEADER)
         btn_frame.place(relx=1.0, rely=0.5, anchor='e', x=-12)
 
-        if not self._is_group_chat(chat_id):
+        for icon, ctype in [("📞", "audio"), ("🎥", "video")]:
             tk.Button(
-                btn_frame, text="📞", font=("Segoe UI", 16),
+                btn_frame, text=icon, font=("Segoe UI", 16),
                 bg=C_HEADER, fg=C_TEXT, relief='flat',
                 cursor='hand2',
-                command=lambda: self._start_call("audio")
+                command=lambda ct=ctype: self._start_call(ct)
             ).pack(side='left', padx=4)
 
         tk.Button(
@@ -2001,31 +2284,19 @@ class ChatWindow:
         if not self.current_chat:
             messagebox.showinfo("No chat selected", "Select a conversation first.")
             return
-            
-        if self._is_group_chat(self.current_chat):
-            messagebox.showinfo(
-                "Not Supported", 
-                "Live calls are only supported for 1-on-1 direct messages.\n\n"
-                "To share media with a group, please use the Attachment (📎) button to send an audio file."
-            )
-            return
-
         if self.active_call_window:
             messagebox.showinfo("Already in call", "You are already in a call.")
             return
-            
         self.net.request_call(self.current_chat, call_type)
         self._show_status(f"📞 Calling {self.current_chat}…")
-        self._open_call_window(self.current_chat, call_type)
-        
-        # THE FIX: Tell the caller that they are calling, not "Connected"
-        self.active_call_window.update_status("Calling...")
 
     def _open_call_window(self, peer: str, call_type: str):
         self.active_call_window = CallWindow(
             self.root, self.net, peer, call_type,
             on_end=self._call_ended_cleanup
         )
+        if call_type == 'video' and PIL_AVAILABLE:
+            self.active_call_window.poll_local_pip()
 
     def _call_ended_cleanup(self):
         self.active_call_window = None
@@ -2260,17 +2531,12 @@ class ChatWindow:
 
             def on_accept():
                 self.net.accept_call(caller)
+                self.net.call_manager.accept_incoming_call(call_type)
                 self._open_call_window(caller, call_type)
-                if self.active_call_window:
-                    self.active_call_window.update_status("Connected")
-                
-                # THE FIX: Tell the Callee to start their UDP threads too!
-                if self.net.call_manager.incoming_caller_addr:
-                    ip, port = self.net.call_manager.incoming_caller_addr
-                    self.net.call_manager.start_symmetric_call(ip, port, call_type)
 
             def on_reject():
                 self.net.reject_call(caller)
+                self.net.call_manager.end_call()
 
             IncomingCallDialog(self.root, caller, call_type, on_accept, on_reject)
 
@@ -2280,13 +2546,15 @@ class ChatWindow:
         elif etype == 'CALL_RINGING':
             _, peer = event
             self._show_status(f"📞 Ringing {peer}…")
-            if self.active_call_window:
-                self.active_call_window.update_status("Ringing...")
 
-        elif etype == 'CALL_CONNECTED':
-            _, peer = event
-            if self.active_call_window:
-                self.active_call_window.update_status("Connected")
+        elif etype == 'CALL_ACCEPTED':
+            _, callee = event
+            self._show_status(f"✅ {callee} accepted!")
+            if not self.active_call_window:
+                ctype = self.net.current_call_type or 'audio'
+                self._open_call_window(callee, ctype)
+                if self.active_call_window:
+                    self.active_call_window.update_status("Connected")
 
         elif etype == 'CALL_REJECTED':
             _, callee = event
