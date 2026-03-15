@@ -4,13 +4,11 @@ import socket
 import threading
 import queue
 import time
-import pickle
-import struct
 import pyaudio
 import os
 import base64
 from datetime import datetime
-from .utils import (
+from utils import (
     send_framed_msg, receive_framed_msg, get_file_type,
     PKT_AUDIO, PKT_END,
     AUDIO_FORMAT, AUDIO_CHANNELS, AUDIO_RATE, AUDIO_CHUNK
