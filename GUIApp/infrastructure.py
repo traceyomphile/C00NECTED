@@ -15,7 +15,8 @@ def get_connection(db_file: str = DB_FILE) -> sqlite3.Connection:
     # Intialise database to wait for 15 seconds if db locked by another write
     conn = sqlite3.connect(
         db_file, timeout=15,
-        check_same_thread=False     # Allow access across threads
+        check_same_thread=False,
+        detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES     # Allow access across threads
     )
 
     conn.row_factory = sqlite3.Row
