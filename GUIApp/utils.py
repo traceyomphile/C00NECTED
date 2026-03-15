@@ -4,9 +4,7 @@ import os
 import socket
 import re
 import threading
-import queue
 import time
-import base64
 import pyaudio
 import wave as _wave
 import tempfile
