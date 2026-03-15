@@ -136,8 +136,8 @@ def initialise_database():
 
         # Indexes for fast lookup
         cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_chat_recipient_timestamp
-        ON chat_messages (recipient, timestamp)
+        CREATE INDEX IF NOT EXISTS idx_chat_sender
+        ON chat_messages (recipient)
         """)
 
         cursor.execute("""

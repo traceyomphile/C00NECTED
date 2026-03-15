@@ -1,20 +1,4 @@
-"""
-ChatHistory.py - Client-side chat history cache
-File: chat_history/<username>/json
-Format: { chat_id: [msg_dict, ...], ... }
 
-Properties:
-    - conversations: Public property that returns the set of all conversations the user had.
-    - known_groups: Public property that returns the set of all known groups.
-
-Methods:
-    - append: Appends one message dict and persists immediately.
-    - ad_to_known_groups: Add a newly created group to the known groups set.
-    - create_conv_slot: Create an empty conversation slot for a new conversation.
-    - delete_chat: Deletes an a conversation/chat slot.
-
-Date: 15-03-2026
-"""
 import os
 import threading
 import json
@@ -53,7 +37,7 @@ class ChatHistory:
         if from server=True, we try to avoid duplicates based on timestamp.
         """
         with self._lock:
-            conv = self.conversations.setdefault('chat_id', [])
+            conv = self.conversations.setdefault(chat_id, [])
 
             # Deduplication when merging from server
             if from_server:
@@ -108,11 +92,12 @@ class ChatHistory:
             if latest_ts:
                 self.set_last_fetched(chat_id, latest_ts)
 
-    def create_conv_slot(self, chat_id: str):
+    def ensure_chat(self, chat_id: str):
         """Create an empty conversation slot if it doesn't exist."""
         with self._lock:
-            self.conversations.setdefault('conversations', [])
-            self._save_nolock()
+            if chat_id not in self.conversations:
+                self.conversations[chat_id] = []
+                self._save_nolock()
 
     def delete_chat(self, chat_id: str):
         with self._lock:

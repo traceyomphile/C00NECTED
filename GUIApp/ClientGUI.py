@@ -3,6 +3,7 @@
 ClientGUI.py - Main GUI entry point for C00NECTED
 """
 
+import json
 import tkinter as tk
 from tkinter import messagebox, filedialog, simpledialog
 import threading
@@ -18,7 +19,7 @@ from utils import (
     C_BG, C_SIDEBAR, C_HEADER, C_SENT, C_RECV, C_INPUT_BG, C_ACCENT, C_ACCENT_LT,
     C_GREEN, C_TEXT, C_SECONDARY, C_HOVER, C_BORDER, C_RED, C_AMBER, C_ONLINE,
     C_TICK_GREY, C_TICK_BLUE, FONT_APP, FONT_BOLD, FONT_SMALL, FONT_MICRO,
-    C_PANEL, get_file_type, parse_incoming_message, VoiceRecorder
+    C_PANEL, send_framed_msg, get_file_type, parse_incoming_message, VoiceRecorder
 )
 try:
     from PIL import Image, ImageTk
@@ -527,7 +528,7 @@ class ChatWindow:
         self.username   = username
         self.gui_queue  = gui_queue
 
-        self.history    = ChatHistory.ChatHistory(username)
+        self.history = ChatHistory(username)
 
         self.conversations: dict[str, list] = {
             k: list(v) for k, v in self.history.conversations.items()
@@ -1149,11 +1150,29 @@ class ChatWindow:
         return False
 
     def _open_chat(self, chat_id: str):
-        if chat_id and chat_id != self.current_chat:
-            self.current_chat = chat_id
-            self.unread_counts[chat_id] = 0
-            self._update_chat_list()
-            self._build_chat_right(chat_id)
+        if not chat_id or chat_id == self.current_chat:
+            return
+        
+        self.current_chat = chat_id
+        self.unread_counts[chat_id] = 0
+        self._update_chat_list()
+
+        # ------ Sync LOgic -----------------
+        self.history.ensure_chat(chat_id)
+
+        if self._is_group_chat(chat_id):
+            self.history.add_to_known_groups(chat_id)
+
+        # Request messages newer than the last time we synced this chat
+        last_ts = self.history.get_last_fetched(chat_id) or "2026-03-15 00:00"
+
+        if self.net.tcp_sock:
+            send_framed_msg(self.net.tcp_sock, f"GET_HISTORY:{chat_id}:{last_ts}", msg_type='C')
+        else:
+            self._show_status("Cannot load history - not connected")
+
+        self._show_status("Loading recent messages....")
+        self._build_chat_right(chat_id)
 
     def _filter_chats(self, *_):
         txt = self.search_var.get()
@@ -1262,8 +1281,6 @@ class ChatWindow:
             self.root, self.net, peer, call_type,
             on_end=self._call_ended_cleanup
         )
-        if call_type == 'video' and PIL_AVAILABLE:
-            self.active_call_window.poll_local_pip()
 
     def _call_ended_cleanup(self):
         self.active_call_window = None
@@ -1300,7 +1317,7 @@ class ChatWindow:
             user = user.strip()
             if user and user not in self.conversations:
                 self.conversations[user] = []
-                self.history.create_conv_slot(user)
+                self.history.ensure_chat(user)
                 self._update_chat_list()
             self.current_chat = user
             self._build_chat_right(user)
@@ -1314,7 +1331,7 @@ class ChatWindow:
             self.history.add_to_known_groups(name)
             if name not in self.conversations:
                 self.conversations[name] = []
-                self.history.create_conv_slot(name)
+                self.history.ensure_chat(name)
                 self._update_chat_list()
             self.current_chat = name
             self._build_chat_right(name)
@@ -1341,7 +1358,7 @@ class ChatWindow:
         self.history.add_to_known_groups(name)
         if name not in self.conversations:
             self.conversations[name] = []
-            self.history.create_conv_slot(name)
+            self.history.ensure_chat(name)
         self._update_chat_list()
         self.current_chat = name
         self._build_chat_right(name)
@@ -1421,6 +1438,23 @@ class ChatWindow:
                 self._show_status(raw_msg)
                 return
 
+            if raw_msg.startswith("HISTORY:"):
+                try:
+                    _, chat_id, json_payload = raw_msg.split(":", 2)
+                    messages = json.loads(json_payload)
+
+                    self.history.merge_from_server(chat_id, messages)
+
+                    if chat_id == self.current_chat:
+                        self._render_all_messages()
+                        self._scroll_to_bottom()
+                        self._show_status(f"Loaded {len(messages)} message(s)")
+
+                except Exception as e:
+                    self._show_status("Could not load history!")
+
+                return
+            
             if raw_msg in _SILENT:
                 return
             if any(raw_msg.startswith(p) for p in _STATUS_PREFIXES):
@@ -1432,11 +1466,9 @@ class ChatWindow:
                 return
 
             parsed = parse_incoming_message(raw_msg, self.username)
-            msg_id = parsed.get('id')
-                
+
             if parsed['type'] == 'dm':
                 sender = parsed['sender']
- 
                 if sender == 'SYSTEM':
                     content = parsed.get('content', '')
                     target = next(
@@ -1444,12 +1476,6 @@ class ChatWindow:
                         self.current_chat if self._is_group_chat(self.current_chat or '') else None
                     )
                     if target:
-                        messages = self.conversations[chat_id]['messages']
-                        for msg in messages:
-                            if msg.get('id') == msg_id and msg.get('status') == 'pending':
-                                msg['status'] = 'delivered'
-                                return
-                
                         self._append_message(target, {
                             'type': 'system', 'content': content,
                             'sender': 'SYSTEM', 'outgoing': False

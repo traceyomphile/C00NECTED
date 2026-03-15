@@ -428,29 +428,19 @@ def send_dm(sender: str, target: str, content: str, send_func: callable, queue_f
         - True if the message was processed successfully (sent or queued).
     """
     timestamped_msg = f"[{get_timestamp()}] [{sender} (DM)]: {content}"
+    save_message(sender, timestamped_msg, recipient=target)
+
     with clients_lock:
         if target in clients:
             try:
                 sock = clients[target][0]
                 send_func(sock, timestamped_msg, 'D')
-                save_message(
-                    sender, 
-                    timestamped_msg, 
-                    recipient=target if not is_group else None,
-                    is_system=(sender== "SYSTEM")
-                )
                 return True
             except Exception:
                 # Socket failed, fall through to queuing
                 pass
     
     queue_func(target, timestamped_msg)
-    save_message(
-        sender, 
-        timestamped_msg, 
-        recipient=target if not is_group else None,
-        is_system=(sender== "SYSTEM")
-    )
     return True
     
 def send_group_message(sender: str, group_id: str, message: str, send_func: callable, queue_func: callable) -> str:
@@ -471,31 +461,40 @@ def send_group_message(sender: str, group_id: str, message: str, send_func: call
 
     try:
         cur.execute(
+            "SELECT 1 FROM groups WHERE group_id=?",
+            (group_id,)
+        )
+        if not cur.fetchone():
+            return "GROUP_NOT_FOUND"
+
+        cur.execute(
+            "SELECT username FROM group_members WHERE group_id=? AND username=?",
+            (group_id,sender)
+        )
+        if not cur.fetchone():
+            return "NOT_MEMBER"
+        
+        cur.execute(
             "SELECT username FROM group_members WHERE group_id=?",
             (group_id,)
         )
-
         members = [row[0] for row in cur.fetchall()]
     finally:
         conn.close()
 
     timestamped = f"[{get_timestamp()}] [{group_id}] {sender}: {message}"
-    save_message(
-        sender, 
-        timestamped, 
-        group_id=group_id, 
-        is_system=(sender == 'SYSTEM')
-    )
+    save_message(sender, message, group_id=group_id, is_system=(sender == 'SYSTEM'))
+
     for member in members:
         if member == sender:
             continue
 
         with clients_lock:
-            sock = clients.get(member)
+            clients_info = clients.get(member)
 
-        if sock:
+        if clients_info:
             try:
-                send_func(sock[0], timestamped, 'D')
+                send_func(clients_info[0], timestamped, 'D')
             except:
                 queue_func(member, timestamped)
         else:
@@ -521,6 +520,9 @@ def save_message(sender: str, content: str, recipient: str | None = None, group_
     Returns:
         - None.
     """
+    if (recipient is None) == (group_id is None):
+        raise ValueError("Exactly one of recipient or group_id must be set.")
+    
     with db_lock:
         conn = get_db()
         cur = conn.cursor()
@@ -528,7 +530,7 @@ def save_message(sender: str, content: str, recipient: str | None = None, group_
         try:
             cur.execute("""
                 INSERT INTO chat_messages
-                (sender, recipient, group_id, content, is_system, media)
+                (sender, recipient, group_id, content, is_system, media_id)
                 VALUES (?, ?, ?, ?, ? ,?)
             """, (sender, recipient, group_id, content, 1 if is_system else 0, media_id))
             conn.commit()
