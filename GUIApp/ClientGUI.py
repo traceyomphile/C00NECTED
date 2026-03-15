@@ -15,10 +15,10 @@ import wave as _wave
 import random as _rnd, hashlib as _hs
 
 from utils import (
-    C_BG, C_SIDEBAR, C_HEADER, C_SENT, C_RECV, C_INPUT_BG, C_INPUT_BAR, C_ACCENT, C_ACCENT_LT,
-    C_GREEN, C_GREEN_LT, C_TEXT, C_SECONDARY, C_HOVER, C_BORDER, C_RED, C_AMBER, C_ONLINE,
-    C_TICK_GREY, C_TICK_BLUE, FONT_APP, FONT_BOLD, FONT_SMALL, FONT_MICRO, FONT_LARGE, FONT_LOGO,
-    C_PANEL, FONT_SUB, get_file_type, parse_incoming_message, VoiceRecorder
+    C_BG, C_SIDEBAR, C_HEADER, C_SENT, C_RECV, C_INPUT_BG, C_ACCENT, C_ACCENT_LT,
+    C_GREEN, C_TEXT, C_SECONDARY, C_HOVER, C_BORDER, C_RED, C_AMBER, C_ONLINE,
+    C_TICK_GREY, C_TICK_BLUE, FONT_APP, FONT_BOLD, FONT_SMALL, FONT_MICRO,
+    C_PANEL, get_file_type, parse_incoming_message, VoiceRecorder
 )
 try:
     from PIL import Image, ImageTk
