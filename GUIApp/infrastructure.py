@@ -120,6 +120,30 @@ def initialise_database():
         )
         """)
 
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender TEXT NOT NULL,
+            recipient TEXT,
+            group_id TEXT,
+            content TEXT NOT NULL,
+            timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            is_system BOOLEAN DEFAULT 0,
+            media_id INTEGER,
+            FOREIGN KEY(media_id) REFERENCES media(id)          
+            )
+        """)
+
+        # Indexes for fast lookup
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_chat_sender
+        ON chat_messages (recipient)
+        """)
+
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_chat_group_timestamp
+        ON chat_messages (group_id, timestamp)
+        """)
         conn.commit()
     
     except Exception as e:

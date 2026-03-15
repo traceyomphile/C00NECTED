@@ -20,6 +20,8 @@ Integrations:
 Date: 2026-03-11
 """
 
+from datetime import datetime
+import json
 import select
 import socket
 import threading
@@ -484,6 +486,68 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             if status != "SUCCESS":
                 send_framed_msg(client_socket, f"ERROR: {status}", 'C')
 
+        elif command == "GET_HISTORY":
+            parts = data.split(":", 1)
+            if len(parts) != 2:
+                send_framed_msg(client_socket, "ERROR: Bad GET_HISTORY format", 'C')
+                continue
+
+            chat_id, since_str = parts
+            since_str = since_str.strip()
+
+            try:
+                since_dt = datetime.strptime(since_str, "%Y-%m-%d %H:%M:%S")
+            except:
+                since_dt = datetime(2026, 3, 15)
+
+            conn = get_db()
+            cur = conn.cursor()
+
+            try:
+                if ChatServer.is_group(chat_id):
+                    cur.execute("""
+                        SELECT id, sender, content, timestamp, is_system, media_id
+                        FROM chat_messages
+                        WHERE group_id = ? AND timestamp > ?
+                        ORDER BY timestamp ASC
+                        LIMIT 500
+                    """, (chat_id, since_dt))
+                else:
+                    cur.execute("""
+                        SELECT id, sender, content, timestamp, is_system, media_id
+                        FROM chat_messages
+                        WHERE recipient = ? AND sender != ? AND timestamp > ?
+                            OR sender = ? AND recipient = ? AND timestamp > ?
+                        ORDER BY timestamp ASC
+                        LIMIT 500
+                    """, (chat_id, username, since_dt, username, chat_id, since_dt))
+
+                rows = cur.fetchall()
+
+                messages = []
+                for row in rows:
+                    msg = {
+                        'id': row['id'],
+                        'sender': row['sender'],
+                        'content': row['content'],
+                        'timestamp': row['timestamp'],
+                        'is_system': bool(row['is_system']),
+                        'media_id': row['media_id']
+                    }
+                    messages.append(msg)
+
+                if messages:
+                    payload = json.dumps(messages, ensure_ascii=False)
+                    send_framed_msg(client_socket, f"HISTORY:{chat_id}:{payload}", 'D')
+                else:
+                    send_framed_msg(client_socket, f"HISTORY:{chat_id}:[]", 'D')
+
+            except Exception as e:
+                send_framed_msg(client_socket, "ERROR: History fetch failed.", 'C')
+            
+            finally:
+                conn.close()
+                
         # --------- MEDIA UPLOAD ---------
         # Client sends: UPLOAD_MEDIA:<recipient_or_group>:<filename>|<base64_data>
         # Server replies: MEDIA_ID:<id> - the client can share this ID so the recipient can download.
