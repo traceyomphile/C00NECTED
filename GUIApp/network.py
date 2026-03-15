@@ -16,7 +16,7 @@ from utils import (
 
 # ------------ SERVER CONFIGURATION -----------------
 
-SERVER_IP   = '196.47.192.177'
+SERVER_IP   = '196.47.'
 TCP_PORT    = 50000
 
 # -------------- CALL MANAGER ----------------------
