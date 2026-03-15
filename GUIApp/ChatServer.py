@@ -433,12 +433,24 @@ def send_dm(sender: str, target: str, content: str, send_func: callable, queue_f
             try:
                 sock = clients[target][0]
                 send_func(sock, timestamped_msg, 'D')
+                save_message(
+                    sender, 
+                    timestamped_msg, 
+                    recipient=target if not is_group else None,
+                    is_system=(sender== "SYSTEM")
+                )
                 return True
             except Exception:
                 # Socket failed, fall through to queuing
                 pass
     
     queue_func(target, timestamped_msg)
+    save_message(
+        sender, 
+        timestamped_msg, 
+        recipient=target if not is_group else None,
+        is_system=(sender== "SYSTEM")
+    )
     return True
     
 def send_group_message(sender: str, group_id: str, message: str, send_func: callable, queue_func: callable) -> str:
@@ -468,7 +480,12 @@ def send_group_message(sender: str, group_id: str, message: str, send_func: call
         conn.close()
 
     timestamped = f"[{get_timestamp()}] [{group_id}] {sender}: {message}"
-
+    save_message(
+        sender, 
+        timestamped, 
+        group_id=group_id, 
+        is_system=(sender == 'SYSTEM')
+    )
     for member in members:
         if member == sender:
             continue
@@ -486,7 +503,41 @@ def send_group_message(sender: str, group_id: str, message: str, send_func: call
 
     return "SUCCESS"
 
-# -----------------
+# -------------------------------------
+# PERSISTENT MESSAGING ACROSS DEVICES
+# -------------------------------------
+
+def save_message(sender: str, content: str, recipient: str | None = None, group_id: str | None = None, is_system: bool = False, media_id: int | None = None):
+    """
+    Persists a message to the server-side chat history.
+
+    Parameters:
+        - sender: a string representing the sender's unique identifier.
+        - content: a string representing the message payload.
+        - recipient: a string represnting a 1-to-1 receiver's unique identifier.
+        - group_id: a string representing a group's unique identifier.
+        - is_system: A boolean value indicating whether the message is a system notification or not.
+        - media_id: An int uniquely pointing to a media file.
+    Returns:
+        - None.
+    """
+    with db_lock:
+        conn = get_db()
+        cur = conn.cursor()
+
+        try:
+            cur.execute("""
+                INSERT INTO chat_messages
+                (sender, recipient, group_id, content, is_system, media)
+                VALUES (?, ?, ?, ?, ? ,?)
+            """, (sender, recipient, group_id, content, 1 if is_system else 0, media_id))
+            conn.commit()
+
+        except Exception:
+            pass
+
+        finally:
+            conn.close()
 # CALL HANDLING
 # -----------------
 

@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-ClientGUI.py - WhatsApp-inspired GUI client for C00NECTED chat system.
-Integrates all networking from Client.py with a polished Tkinter UI.
+ClientGUI.py - Main GUI entry point for C00NECTED
 """
 
-import Utility
-import ProtocolHandler
-import ChatHistory
-import NetworkClient
 import tkinter as tk
 from tkinter import messagebox, filedialog, simpledialog
 import threading
 import queue
+import cv2
 import time
 import os
 import pyaudio
@@ -19,67 +15,20 @@ from datetime import datetime
 import wave as _wave
 import random as _rnd, hashlib as _hs
 
+from .utils import (
+    C_BG, C_SIDEBAR, C_HEADER, C_SENT, C_RECV, C_INPUT_BG, C_INPUT_BAR, C_ACCENT, C_ACCENT_LT,
+    C_GREEN, C_GREEN_LT, C_TEXT, C_SECONDARY, C_HOVER, C_BORDER, C_RED, C_AMBER, C_ONLINE,
+    C_TICK_GREY, C_TICK_BLUE, FONT_APP, FONT_BOLD, FONT_SMALL, FONT_MICRO, FONT_LARGE, FONT_LOGO,
+    C_PANEL, FONT_SUB, get_file_type, parse_incoming_message, VoiceRecorder
+)
 try:
     from PIL import Image, ImageTk
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────────────────────────────────────
-
-SERVER_IP   = '196.47.192.177'
-TCP_PORT    = 50000
-MAX_VIDEO_SECONDS = 45
-
-PKT_AUDIO   = b'\x01'
-PKT_VIDEO   = b'\x02'
-PKT_END     = b'\xFF'
-
-AUDIO_FORMAT   = pyaudio.paInt16
-AUDIO_CHANNELS = 1
-AUDIO_RATE     = 44100
-AUDIO_CHUNK    = 1024
-
-IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
-AUDIO_EXTS = {'.mp3', '.wav', '.flac', '.ogg', '.aac'}
-VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
-PDF_EXTS   = {'.pdf'}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# COLORS & FONTS  — deep navy blue theme
-# ─────────────────────────────────────────────────────────────────────────────
-
-C_BG        = "#060D1A"   # near-black navy
-C_SIDEBAR   = "#08142A"   # sidebar panel
-C_PANEL     = "#0B1A2F"   # chat panel
-C_HEADER    = "#0D2040"   # header bars
-C_SENT      = "#0F2F6E"   # outgoing message bubble
-C_RECV      = "#0A1A30"   # incoming message bubble
-C_INPUT_BG  = "#091525"   # input field bg
-C_INPUT_BAR = "#0F2440"   # Distinct input bar at bottom
-C_ACCENT    = "#2563EB"   # primary blue accent
-C_ACCENT_LT = "#3B82F6"   # lighter blue (hover/active)
-C_GREEN     = "#2563EB"   # kept as alias so existing refs work
-C_GREEN_LT  = "#3B82F6"
-C_TEXT      = "#F0F4FF"   # primary text
-C_SECONDARY = "#7B8FA6"   # muted/placeholder text
-C_HOVER     = "#12284A"   # hover backgrounds
-C_BORDER    = "#1E3A5F"   # dividers / borders
-C_RED       = "#EF4444"   # error / danger
-C_AMBER     = "#F59E0B"   # warnings
-C_ONLINE    = "#22C55E"   # online presence dot
-C_TICK_GREY = "#7B8FA6"   # delivered (grey) ticks
-C_TICK_BLUE = "#60A5FA"   # read (blue) ticks
-
-FONT_APP    = ("Segoe UI", 10)
-FONT_BOLD   = ("Segoe UI", 10, "bold")
-FONT_SMALL  = ("Segoe UI", 9)
-FONT_MICRO  = ("Segoe UI", 8)
-FONT_LARGE  = ("Segoe UI", 14, "bold")
-FONT_LOGO   = ("Consolas", 36, "bold")
-FONT_SUB    = ("Segoe UI", 11)
+from .history import ChatHistory
+from .network import NetworkClient
 
 # Consistent window dimensions
 WINDOW_WIDTH = 1100
@@ -425,7 +374,7 @@ class CallWindow(tk.Toplevel):
     - Audio call: avatar + timer + mute/end buttons.
     """
 
-    def __init__(self, root, net: NetworkClient.NetworkClient, peer: str, call_type: str, on_end):
+    def __init__(self, root, net: NetworkClient, peer: str, call_type: str, on_end):
         super().__init__(root)
         self.net       = net
         self.peer      = peer
@@ -572,7 +521,7 @@ class IncomingCallDialog(tk.Toplevel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ChatWindow:
-    def __init__(self, root: tk.Tk, net: NetworkClient.NetworkClient, username: str,
+    def __init__(self, root: tk.Tk, net: NetworkClient, username: str,
                  gui_queue: queue.Queue):
         self.root       = root
         self.net        = net
@@ -593,7 +542,7 @@ class ChatWindow:
 
         self.unread_counts: dict[str, int]  = {}
         self._tick_labels: dict[str, tk.Label] = {}
-        self._voice_rec   = Utility.VoiceRecorder()
+        self._voice_rec   = VoiceRecorder()
         self._is_recording = False
 
         if 'SYSTEM' in self.conversations:
@@ -1221,6 +1170,7 @@ class ChatWindow:
 
         chat_id  = self.current_chat
         is_group = self._is_group_chat(chat_id)
+
         if is_group:
             self.net.send_group_msg(chat_id, text)
         else:
@@ -1252,7 +1202,7 @@ class ChatWindow:
             ]
         )
         if not fp: return
-        ftype = ProtocolHandler.get_file_type(fp)
+        ftype = get_file_type(fp)
         if ftype == 'unknown':
             messagebox.showerror("Unsupported", "That file type is not supported.")
             return
@@ -1482,10 +1432,12 @@ class ChatWindow:
                 self._show_status(raw_msg)
                 return
 
-            parsed = ProtocolHandler.parse_incoming_message(raw_msg, self.username)
-
+            parsed = parse_incoming_message(raw_msg, self.username)
+            msg_id = parsed.get('id')
+                
             if parsed['type'] == 'dm':
                 sender = parsed['sender']
+ 
                 if sender == 'SYSTEM':
                     content = parsed.get('content', '')
                     target = next(
@@ -1493,6 +1445,12 @@ class ChatWindow:
                         self.current_chat if self._is_group_chat(self.current_chat or '') else None
                     )
                     if target:
+                        messages = self.conversations[chat_id]['messages']
+                        for msg in messages:
+                            if msg.get('id') == msg_id and msg.get('status') == 'pending':
+                                msg['status'] = 'delivered'
+                                return
+                
                         self._append_message(target, {
                             'type': 'system', 'content': content,
                             'sender': 'SYSTEM', 'outgoing': False
