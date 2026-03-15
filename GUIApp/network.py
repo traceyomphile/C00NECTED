@@ -604,7 +604,7 @@ class NetworkClient:
 
             with open(save_path, 'wb') as f:
                 while received < filesize:
-                    chunk = conn.recv(min(4096, filesize - received))
+                    chunk = rfile.read(min(4096, filesize - received))
                     if not chunk: 
                         break
 
