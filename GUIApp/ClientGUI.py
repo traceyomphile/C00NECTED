@@ -1754,12 +1754,14 @@ class ChatWindow:
         btn_frame = tk.Frame(hdr, bg=C_HEADER)
         btn_frame.place(relx=1.0, rely=0.5, anchor='e', x=-12)
 
-        for icon, ctype in [("📞", "audio"), ("🎥", "video")]:
+        # Group chats: no call buttons at all.
+        # One-to-one chats: audio call only (no video).
+        if not self._is_group_chat(chat_id):
             tk.Button(
-                btn_frame, text=icon, font=("Segoe UI", 16),
+                btn_frame, text="📞", font=("Segoe UI", 16),
                 bg=C_HEADER, fg=C_TEXT, relief='flat',
                 cursor='hand2',
-                command=lambda ct=ctype: self._start_call(ct)
+                command=lambda: self._start_call('audio')
             ).pack(side='left', padx=4)
 
         tk.Button(
@@ -2296,6 +2298,10 @@ class ChatWindow:
         if not self.current_chat:
             messagebox.showinfo("No chat selected", "Select a conversation first.")
             return
+        if self._is_group_chat(self.current_chat):
+            return   # calls not supported in group chats
+        if call_type == 'video':
+            return   # video calls removed
         if self.active_call_window:
             messagebox.showinfo("Already in call", "You are already in a call.")
             return
