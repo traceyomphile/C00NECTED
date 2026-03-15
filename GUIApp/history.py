@@ -78,19 +78,18 @@ class ChatHistory:
         """
         if not server_messages:
             return
-        
-        with self._lock:
-            # Find the latest timestamp in this batch
-            latest_ts = max(
-                (m.get('timestamp') for m in server_messages),
-                default=None
-            )
 
-            for msg in server_messages:
-                self.append(chat_id, msg, from_server=True)
+        # Find the latest timestamp in this batch
+        latest_ts = max(
+            (m.get('timestamp') for m in server_messages),
+            default=None
+        )
 
-            if latest_ts:
-                self.set_last_fetched(chat_id, latest_ts)
+        for msg in server_messages:
+            self.append(chat_id, msg, from_server=True)
+
+        if latest_ts:
+            self.set_last_fetched(chat_id, latest_ts)
 
     def ensure_chat(self, chat_id: str):
         """Create an empty conversation slot if it doesn't exist."""
@@ -102,7 +101,9 @@ class ChatHistory:
     def delete_chat(self, chat_id: str):
         with self._lock:
             self.conversations.pop(chat_id, None)
-            self.known_groups.discard(chat_id)
+            known = self._data.get('known_groups', [])
+            if chat_id in known:
+                known.remove(chat_id)
             self.last_fetched.pop(chat_id, None)
             self._save_nolock()
 
@@ -134,7 +135,7 @@ class ChatHistory:
         try:
             data_to_save = {**self._data, '_version': self.CACHE_VERSION}
             with open(self._path, 'w', encoding='utf-8') as f:
-                json.dump(self._data, f, ensure_ascii=False, indent=2)
+                json.dump(data_to_save, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 

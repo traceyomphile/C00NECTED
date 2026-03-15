@@ -1661,12 +1661,7 @@ class App:
         self.gui_queue = queue.Queue()
         self.net = NetworkClient(self.gui_queue)
 
-        connected = self.net.connect()
-
-        if connected:
-            SplashScreen(self.root, self._show_auth)
-        else:
-            self._show_connect_error()
+        SplashScreen(self.root, self._start_connect)
 
     def _show_connect_error(self):
         for w in self.root.winfo_children():
@@ -1688,6 +1683,16 @@ class App:
             SplashScreen(self.root, self._show_auth)
         else:
             self._show_connect_error()
+
+    def _start_connect(self):
+        threading.Thread(target=self._connect_worker, daemon=True).start()
+
+    def _connect_worker(self):
+        connected = self.net.connect()
+        if connected:
+            self.root.after(0, self._show_auth)
+        else:
+            self.root.after(0, self._show_connect_error)
 
     def _show_auth(self):
         for w in self.root.winfo_children():
