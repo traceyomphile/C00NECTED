@@ -7,7 +7,6 @@ import tkinter as tk
 from tkinter import messagebox, filedialog, simpledialog
 import threading
 import queue
-import cv2
 import time
 import os
 import pyaudio
