@@ -140,7 +140,7 @@ class AuthWindow:
 
     CARD_W = 400
 
-    def __init__(self, root: tk.Tk, net: NetworkClient.NetworkClient, on_success):
+    def __init__(self, root: tk.Tk, net: NetworkClient, on_success):
         self.root       = root
         self.net        = net
         self.on_success = on_success
@@ -1659,7 +1659,7 @@ class App:
         self.root.geometry(f"{w}x{h}+{x}+{y}")
 
         self.gui_queue = queue.Queue()
-        self.net = NetworkClient.NetworkClient(self.gui_queue)
+        self.net = NetworkClient(self.gui_queue)
 
         connected = self.net.connect()
 
