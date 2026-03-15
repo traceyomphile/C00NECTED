@@ -438,17 +438,20 @@ class CallManager:
             self.udp_sock.sendto(b'PUNCH_ACK', addr)
 
     def _start_media_threads(self, call_type: str):
-        threading.Thread(target=self._stream_audio, daemon=True, name='audio-send').start()
-        threading.Thread(target=self._recv_audio,   daemon=True, name='audio-recv').start()
+        # Capture the stop event for THIS call; each thread holds its own
+        # reference so it exits when THIS call ends, not some future call.
+        stop = self._stop_event
+        threading.Thread(target=self._stream_audio, args=(stop,), daemon=True, name='audio-send').start()
+        threading.Thread(target=self._recv_audio,   args=(stop,), daemon=True, name='audio-recv').start()
         if call_type == 'video':
-            threading.Thread(target=self._stream_video, daemon=True, name='video-send').start()
-            threading.Thread(target=self._recv_video,   daemon=True, name='video-recv').start()
+            threading.Thread(target=self._stream_video, args=(stop,), daemon=True, name='video-send').start()
+            threading.Thread(target=self._recv_video,   args=(stop,), daemon=True, name='video-recv').start()
 
     # ── Accepting an incoming call (callee side) ──────────────────────────────
 
     def accept_incoming_call(self, call_type: str = 'audio'):
         if not self.incoming_caller_addr:
-            self.gui_queue(('STATUS', 'Call accept failed: no caller address'))
+            self.gui_queue.put(('STATUS', 'Call accept failed: no caller address'))
             return False
 
         self._begin_call(call_type)
@@ -466,11 +469,19 @@ class CallManager:
     def _begin_call(self, call_type: str):
         self.call_ended = False
         self.call_type  = call_type
+        # Fresh stop-event for every call so old threads can't outlive their call
+        self._stop_event = threading.Event()
 
     # ── End call ─────────────────────────────────────────────────────────────
 
     def end_call(self):
         self.call_ended = True
+        # Signal the per-call stop event so any still-running media threads
+        # from THIS call exit immediately, even if call_ended gets reset later
+        if hasattr(self, '_stop_event'):
+            self._stop_event.set()
+        # Reset hole-punch state so the next call can punch through cleanly
+        self._hole_punched.clear()
         if self.udp_sock and self.peer_addr:
             try: 
                 self.udp_sock.sendto(PKT_END, self.peer_addr)
@@ -531,7 +542,7 @@ class CallManager:
 
     # ── Audio threads ─────────────────────────────────────────────────────────
 
-    def _stream_audio(self):
+    def _stream_audio(self, stop_event: threading.Event):
         pa = pyaudio.PyAudio()
         stream = None
         try:
@@ -539,12 +550,12 @@ class CallManager:
                 format=AUDIO_FORMAT, channels=AUDIO_CHANNELS,
                 rate=AUDIO_RATE, input=True, frames_per_buffer=AUDIO_CHUNK
             )
-            while not self.call_ended:
+            while not stop_event.is_set():
                 pcm = stream.read(AUDIO_CHUNK, exception_on_overflow=False)
                 if self.peer_addr:
                     self.udp_sock.sendto(PKT_AUDIO + pcm, self.peer_addr)
         except Exception as e:
-            if not self.call_ended:
+            if not stop_event.is_set():
                 self.gui_queue.put(('STATUS', f'[Call] Audio send error: {e}'))
         finally:
             if stream:
@@ -552,7 +563,7 @@ class CallManager:
                 stream.close()
             pa.terminate()
 
-    def _recv_audio(self):
+    def _recv_audio(self, stop_event: threading.Event):
         pa = pyaudio.PyAudio()
         stream = None
         try:
@@ -560,7 +571,7 @@ class CallManager:
                 format=AUDIO_FORMAT, channels=AUDIO_CHANNELS,
                 rate=AUDIO_RATE, output=True, frames_per_buffer=AUDIO_CHUNK
             )
-            while not self.call_ended:
+            while not stop_event.is_set():
                 try:
                     # Safely pull ONLY audio packets from the mailroom queue
                     payload = self._audio_queue.get(timeout=0.5)
@@ -568,7 +579,7 @@ class CallManager:
                 except queue.Empty:
                     continue
         except Exception as e:
-            if not self.call_ended:
+            if not stop_event.is_set():
                 self.gui_queue.put(('STATUS', f'[Call] Audio recv error: {e}'))
         finally:
             if stream:
@@ -578,10 +589,10 @@ class CallManager:
 
     # ── Video threads ─────────────────────────────────────────────────────────
     
-    def _stream_video(self):
+    def _stream_video(self, stop_event: threading.Event):
         cap = cv2.VideoCapture(0)
         try:
-            while not self.call_ended:
+            while not stop_event.is_set():
                 ret, frame = cap.read()
                 if not ret: break
 
@@ -592,13 +603,13 @@ class CallManager:
                 if self.peer_addr:
                     self.udp_sock.sendto(PKT_VIDEO + length + payload, self.peer_addr)
         except Exception as e:
-            if not self.call_ended:
+            if not stop_event.is_set():
                 self.gui_queue.put(('STATUS', f'[Call] Video send error: {e}'))
         finally:
             cap.release()
 
-    def _recv_video(self):
-        while not self.call_ended:
+    def _recv_video(self, stop_event: threading.Event):
+        while not stop_event.is_set():
             try:
                 # Safely pull ONLY video packets from the mailroom queue
                 datagram = self._video_queue.get(timeout=0.5)
@@ -811,7 +822,13 @@ class NetworkClient:
                 # ── Call peer info (caller gets callee's UDP addr) ──
                 if msg_type == 'C' and msg.startswith("CALL_PEER_INFO:"):
                     _, peer_user, peer_ip, peer_udp_port = msg.split(":")
-                    self.call_manager.start_outgoing_call(peer_ip, peer_udp_port, self.current_call_type)
+                    # Run in its own thread so the TCP receive loop is never
+                    # blocked by the hole-punch wait (up to 10 s).
+                    threading.Thread(
+                        target=self.call_manager.start_outgoing_call,
+                        args=(peer_ip, peer_udp_port, self.current_call_type),
+                        daemon=True
+                    ).start()
                     self.gui_queue.put(('CALL_RINGING', peer_user))
                     continue
 
