@@ -350,6 +350,9 @@ class CallManager:
         self._call_done_event = threading.Event()
         self._hole_punched = threading.Event()
 
+        # Add session variable
+        self.session_id: bytes | None = None
+
     # ── Socket setup ──────────────────────────────────────────────────────────
 
     def create_udp_socket(self) -> int:
@@ -381,6 +384,10 @@ class CallManager:
             except Exception:
                 break
 
+            # Ignore packets we accidentally sent to ourselves
+            if addr == self.udp_sock.getsockname():
+                continue
+
             if not datagram:
                 continue
 
@@ -389,6 +396,10 @@ class CallManager:
                 continue
 
             pkt_type = datagram[0:1]
+            if len(datagram) < 9:
+                continue
+
+            packet_session = datagram[1:9]
 
             if self.call_ended:
                 # If we are not in a call, watch for incoming call packets
@@ -404,11 +415,11 @@ class CallManager:
                 if addr != self.peer_addr:
                     continue
                 if pkt_type == PKT_AUDIO:
+                    if packet_session != self.session_id:
+                        continue
+
                     if not self._audio_queue.full():
                         self._audio_queue.put_nowait(datagram[1:])
-                elif pkt_type == PKT_VIDEO:
-                    if not self._video_queue.full():
-                        self._video_queue.put_nowait(datagram)
                 elif pkt_type == PKT_END:
                     self.call_ended = True
                     self.gui_queue.put(("CALL_ENDED_REMOTE",))
@@ -444,9 +455,6 @@ class CallManager:
     def _start_media_threads(self, call_type: str):
         threading.Thread(target=self._stream_audio, daemon=True, name='audio-send').start()
         threading.Thread(target=self._recv_audio,   daemon=True, name='audio-recv').start()
-        if call_type == 'video':
-            threading.Thread(target=self._stream_video, daemon=True, name='video-send').start()
-            threading.Thread(target=self._recv_video,   daemon=True, name='video-recv').start()
 
     # ── Accepting an incoming call (callee side) ──────────────────────────────
 
@@ -471,11 +479,14 @@ class CallManager:
         self.call_ended = False
         self.call_type  = call_type
         self._hole_punched.clear()  # Reset for each new call (fixes callee re-call hole-punch)
+        self.session_id = os.urandom(8)
 
     # ── End call ─────────────────────────────────────────────────────────────
 
     def end_call(self):
         self.call_ended = True
+        self.session_id = None
+
         if self.udp_sock and self.peer_addr:
             try: 
                 self.udp_sock.sendto(PKT_END, self.peer_addr)
@@ -547,7 +558,8 @@ class CallManager:
             while not self.call_ended:
                 pcm = stream.read(AUDIO_CHUNK, exception_on_overflow=False)
                 if self.peer_addr:
-                    self.udp_sock.sendto(PKT_AUDIO + pcm, self.peer_addr)
+                    packet = PKT_AUDIO + self.session_id + pcm
+                    self.udp_sock.sendto(packet, self.peer_addr)
         except Exception as e:
             if not self.call_ended:
                 self.gui_queue.put(('STATUS', f'[Call] Audio send error: {e}'))
@@ -580,47 +592,6 @@ class CallManager:
                 stream.stop_stream()
                 stream.close()
             pa.terminate()
-
-    # ── Video threads ─────────────────────────────────────────────────────────
-    
-    def _stream_video(self):
-        cap = cv2.VideoCapture(0)
-        try:
-            while not self.call_ended:
-                ret, frame = cap.read()
-                if not ret: break
-
-                small   = cv2.resize(frame, (320, 240))
-                payload = pickle.dumps(small, protocol=4)
-                length  = struct.pack('>I', len(payload))
-
-                if self.peer_addr:
-                    self.udp_sock.sendto(PKT_VIDEO + length + payload, self.peer_addr)
-        except Exception as e:
-            if not self.call_ended:
-                self.gui_queue.put(('STATUS', f'[Call] Video send error: {e}'))
-        finally:
-            cap.release()
-
-    def _recv_video(self):
-        while not self.call_ended:
-            try:
-                # Safely pull ONLY video packets from the mailroom queue
-                datagram = self._video_queue.get(timeout=0.5)
-                if len(datagram) < 5:
-                    continue
-
-                length = struct.unpack('>I', datagram[1:5])[0]
-                payload = datagram[5:5+length]
-                frame = pickle.loads(payload)
-
-                if not self.video_frame_queue.full():
-                    self.video_frame_queue.put_nowait(frame)
-
-            except queue.Empty:
-                continue
-            except Exception as e:
-                continue
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NETWORK CLIENT
@@ -832,10 +803,11 @@ class NetworkClient:
                     continue
 
                 # ── Incoming call notification ──
-                if msg.startswith("AUDIO_CALL:") or msg.startswith("VIDEO_CALL:"):
+                if msg.startswith("AUDIO_CALL:"):
                     parts     = msg.split(":")
                     caller    = parts[1]
-                    call_type = "audio" if msg.startswith("AUDIO_CALL:") else "video"
+                    call_type = "audio"
+                    
                     # Server now includes caller's IP and UDP port in the notification.
                     if len(parts) >= 4:
                         caller_ip       = parts[2]
