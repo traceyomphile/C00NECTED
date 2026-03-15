@@ -169,7 +169,6 @@ def flush_redis_queue(client_socket: socket.socket, recipient: str) -> None:
             else:
                 send_framed_msg(client_socket, msg, 'D')
         except Exception as e:
-            print(f"[ERROR] Failed to flush offline message for {recipient}: {e}")
             redis_client.lpush(key, msg)    # Re-queue on failure and stop
             break
 
@@ -331,7 +330,6 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
                     continue
 
                 register_user(reg_user, reg_pwd)
-                print(f"[REGISTERED USER] {reg_user}")
 
                 username = reg_user
                 send_framed_msg(client_socket, "SUCCESS", 'A')
@@ -346,27 +344,22 @@ def authenticate_client(client_socket: socket.socket, addr) -> str | None:
         # Client sends PORT: (TCP media port) then CALL_PORT: (UDP call port) after auth
         _, port_msg = receive_framed_msg(client_socket)
         if not port_msg or not port_msg.startswith("PORT:"):
-            print(f"[AUTH ERROR] Expected PORT: from {addr}, got: {port_msg!r}")
             return None
         
         tcp_media_port = int(port_msg.split(":")[1])
 
         _, call_port_msg = receive_framed_msg(client_socket)
         if not call_port_msg or not call_port_msg.startswith("CALL_PORT:"):
-            print(f"[AUTH ERROR] Expected CALL_PORT: from {addr}, got: {call_port_msg!r}")
             return None
         udp_call_port = int(call_port_msg.split(":")[1])
 
         # Register with the global ChatServer logic using both ports.
         ChatServer.register_client(username, client_socket, addr[0], tcp_media_port, udp_call_port)
         ChatServer.set_user_online(username, addr[0], tcp_media_port, udp_call_port)
-
-        print(f"[REGISTERED] {username} at {addr[0]} | TCP Media : {tcp_media_port} | UDP Call : {udp_call_port}")
         
         return username
     
     except Exception as e:
-        print(f"[AUTH ERROR] {addr}: {e}")
         try:
             send_framed_msg(client_socket, f"ERROR: Authentication failed: Please reconnect.", 'A')
         except Exception:
@@ -397,15 +390,13 @@ def handle_client(client_socket: socket.socket, addr) -> None:
         main_chat_loop(client_socket, username)
                             
     except Exception as e:
-        print(f"[ERROR] with {addr}: {e}")
+        pass
 
     finally:
         client_socket.close()
 
         if username: 
             ChatServer.remove_client(username)
-
-            print(f"[DISCONNECTED] {username}")
 
 # ----------------
 # MAIN CHAT LOOP
@@ -443,7 +434,6 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 send_framed_msg(client_socket, "TIMEOUT: No activity for 20 minutes. Please reconnect.", 'C')
             except Exception:
                 pass
-            print(f"[TIMEOUT] {username} has been disconnected after {INACTIVITY_TIMEOUT // 60} minutes of inactivity.")
             break
 
         if not full_message: 
@@ -470,14 +460,12 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 timestamped_msg = f"[{ChatServer.get_timestamp()}] [You]: {data}"
                 send_framed_msg(client_socket, timestamped_msg, 'D')
                 send_framed_msg(client_socket, 'DELIVERED', 'C')
-                print(f"[TEXT MESSAGE] {username} -> {username} (self)")
                 continue
 
             target_online = ChatServer.get_user_presence(recipient)
 
             ChatServer.send_dm(username, recipient, data, send_framed_msg, queue_offline_message)
             status = "DELIVERED" if target_online else "QUEUED (offline)"
-            print(f"[TEXT MESSAGE] {username} -> {recipient} | {status}")
             
             # FEATURE: Delivery Notification OR Last Seen feedback
             if target_online:
@@ -490,8 +478,6 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             if not ChatServer.is_group(recipient):
                 send_framed_msg(client_socket, f"ERROR: Group '{recipient}' does not exists.", 'C')
                 continue
-
-            print(f"[GROUP MESSAGE] {username} -> group '{recipient}'")
 
             status = ChatServer.send_group_message(username, recipient, data, send_framed_msg, queue_offline_message)
             
@@ -513,7 +499,6 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 # Determine whether the target is a group or a user
                 if ChatServer.is_group(recipient):
                     media_id = store_media(username, filename, filetype, b64_data, group_id=recipient)
-                    print(f"[MEDIA UPLOAD] {username} -> group '{recipient}' | {filetype} '{filename}' | ID: {media_id}")
 
                     # QUEUE MEDIA_WAITING for every offline group member
                     conn = get_db()
@@ -549,7 +534,6 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
 
                 else:
                     media_id = store_media(username, filename, filetype, b64_data, recipient=recipient)
-                    print(f"[MEDIA UPLOAD] {username} -> {recipient} | {filetype} '{filename}' | ID: {media_id}")
 
                     # Queue MEDIA_WAITING for offline recipient
                     if not ChatServer.get_user_presence(recipient):
@@ -569,11 +553,9 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                 result = get_media(media_id)
 
                 if not result:
-                    print(f"[MEDIA DOWNLOAD] {username} requested ID {media_id} | NOT FOUND")
                     send_framed_msg(client_socket, "ERROR: Media not found.", 'C')
                 else:
                     file_sender, filename, filetype, b64_data = result
-                    print(f"[MEDIA DOWNLOAD] {username} requested ID {media_id} | {filetype} '{filename}'")
                     send_framed_msg(client_socket, f"FILE:{filename}:{filetype}:{b64_data}:{file_sender}", 'D')
 
             except ValueError:
@@ -585,15 +567,12 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         # -------------- GROUP MANAGEMENT -------------
         elif command == "CREATE_GROUP":
             created = ChatServer.create_group(recipient, username)
-            if created:
-                print(f"[GROUP CREATED] '{recipient}' by {username}")
             msg = "GROUP CREATED" if created else "GROUP EXISTS"
             send_framed_msg(client_socket, msg, 'C')
 
         elif command == "ADD_TO_GROUP":
             # 'data' holds the target username to add
             status = ChatServer.add_to_group(recipient, username, data)
-            print(f"[GROUP ADD] {username} added {data} to '{recipient}' | {status}")
             
             # Feature: System Notification for Added User
             if status == "SUCCESS":
@@ -605,7 +584,6 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
 
         elif command == "LEAVE_GROUP":
             left = ChatServer.leave_group(recipient, username)
-            print(f"[GROUP LEAVE] {username} left '{recipient}' | {'OK' if left else 'NOT MEMBER'}")
             if left:
                 # Feature: System Notification for Remaining Members
                 ChatServer.send_group_message("SYSTEM", recipient, f"{username} has left the group.", send_framed_msg, queue_offline_message)
@@ -620,14 +598,12 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             
             if peer:
                 ip, tcp_media_port, _ = peer
-                print(f"[FILE TRANSFER] {username} -> {recipient} | '{filename}' | routed to {ip}:{tcp_media_port}")
                 send_framed_msg(client_socket, f"PEER_INFO:{recipient}:{ip}:{tcp_media_port}", 'C')
 
             else:
                 # Feature: Group File Sharing Support
                 if ChatServer.is_group(recipient):
                     online_peers, offline_members = ChatServer.get_group_presence(recipient, exclude_user=username)
-                    print(f"[FILE TRANSFER] {username} -> group '{recipient}' | '{filename}' | {len(online_peers)} online, {len(offline_members)} offline")
                     
                     # 1. Uploads files for offline users, UPLOAD_MEDIA handles the queuing
                     if offline_members:
@@ -644,7 +620,6 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
                     if not user_exists(recipient):
                         send_framed_msg(client_socket, f"ERROR: User '{recipient}' does not exist.", 'C')
                     else:
-                        print(f"[FILE TRANSFER] {username} -> {recipient} | '{filename}' | OFFLINE")
                         last_seen_time = ChatServer.get_last_seen(recipient)
                         send_framed_msg(client_socket, f"STORE_OFFLINE:{recipient}:{last_seen_time}", 'C')
 
@@ -653,12 +628,10 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             peer = ChatServer.get_call_peer(recipient)
 
             if not peer:
-                print(f"[{call_type} CALL] {username} -> {recipient} | OFFLINE")
                 send_framed_msg(client_socket, f"CALLING: {recipient} is offline", 'C')
                 continue
 
             ip, udp_call_port = peer
-            print(f"[{call_type} CALL] {username} -> {recipient} | routed to {ip}:{udp_call_port}")
             send_framed_msg(client_socket, f"CALL_PEER_INFO:{recipient}:{ip}:{udp_call_port}", 'C')
 
             # Also notify the recipient that an incoming call is coming,
@@ -674,7 +647,6 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
 
         # CALL_ACCEPT: callee accepted - notify the original caller to start streaming.
         elif command == "CALL_ACCEPT":
-            print(f"[CALL ACCEPTED] {username} accepted the call from {recipient}")
             with ChatServer.clients_lock:
                 caller_sock = ChatServer.clients.get(recipient)
 
@@ -686,7 +658,6 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
         
         # CALL_REJECT: callee rejected - notify the original caller.
         elif command == "CALL_REJECT":
-            print(f"[CALL REJECTED] {username} rejected the call from {recipient}")
             with ChatServer.clients_lock:
                 caller_sock = ChatServer.clients.get(recipient)
 
@@ -701,14 +672,10 @@ def main_chat_loop(client_socket: socket.socket, username: str) -> None:
             flush_redis_queue(client_socket, username)
 
         elif command == "EXIT":
-            print(f"[EXIT] {username} disconnected gracefully.")
             break
 
         else:
-            print(f"[UNKNOWN COMMAND] {command} from {username}")
             send_framed_msg(client_socket, "ERROR: UNKNOWN COMMAND.", 'C')
-
-
     
 def start_server() -> None:
     """
