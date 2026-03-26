@@ -11,7 +11,7 @@ import tempfile
 from datetime import datetime
 
 # ----------- SERVER CONFIGURATION ----------
-SERVER_IP = '196.47.192.177'
+SERVER_IP = '196.47.192.124'
 TCP_PORT = 50000
 
 # --------- VIDEO AND AUDIO CONSTANTS ----------
