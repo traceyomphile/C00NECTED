@@ -43,11 +43,13 @@ body {
     justify-content: center;
     align-items: center;
     padding: 2rem;
+    container-type: inline-size;
 }
 
 /* Welcome starts full screen */
 .welcome-panel {
     width: 100vw;
+    height: 100vh;
     opacity: 1;
     transform: translateX(0);
     text-align: center;
@@ -66,17 +68,19 @@ body.show-login .welcome-panel {
     width: 50vw;
 }
 
-body.show-login .login-panel {
-    width: 50vw;
-    opacity: 1;
-    transform: translateX(0);
-    pointer-events: auto;
+body.show-login .logo,
+body.show-login .logo .zero {
+    font-size: 15cqw;
 }
+
+body.show-login .tagline {
+    font-size: 8cqw;
+}
+
 
 /* Welcome content shrinks/moves a bit when login appears */
 .hero {
     width: 100%;
-    max-width: 900px;
     text-align: center;
     transition: transform 1.2s ease, opacity 1.2s ease;
 }
@@ -89,11 +93,11 @@ body.show-login .hero {
 .logo {
     overflow: hidden;
     white-space: nowrap;
-    border-right: 1px solid black;
+    border-right: 0px solid black;
     width: 0;
     animation: typing 2s steps(20, end) forwards;
 
-    font-size: 15vw;
+    font-size: 14vw;
     font-weight: 900;
     font-style: oblique;
     letter-spacing: 1px;
@@ -102,7 +106,7 @@ body.show-login .hero {
 }
 
 .logo .zero {
-    font-size: 15vw;
+    font-size: 14vw;
     font-weight: 900;
     font-style: oblique;
     color: var(--blue);
@@ -184,5 +188,102 @@ body.show-login .hero {
     50% {
         transform: scale(1.15);
         opacity: 1;
+    }
+}
+
+body.show-login .login-panel {
+    width: 50vw;
+    opacity: 1;
+    transform: translateX(0);
+    pointer-events: auto;
+}
+
+.login-wrapper {
+    width: min(420px, 90%);
+    padding: 2rem;
+    border: 1px solid rgba(113, 124, 205, 0.35);
+    border-radius: 18px;
+    background: rgba(0, 0, 0, 0.22);
+    box-shadow: 0 0 24px rgba(47, 121, 255, 0.12);
+}
+
+.login-title {
+    overflow: hidden;
+    white-space: nowrap;
+    border-right: 1px solid transparent;
+    width: 0;
+    animation: loginTyping 1.4s steps(12, end) forwards;
+    animation-delay: 4s;
+
+    font-size: clamp(2.4rem, 6vw, 5rem);
+    font-weight: 900;
+    font-style: oblique;
+    letter-spacing: 1px;
+    margin-bottom: 1rem;
+    color: rgba(19, 83, 179, 0.715);
+}
+
+.login-form .input-group {
+    font-style: italic;
+    opacity: 0;
+    transform: translateX(20px);
+    animation: loginFadeSlide 0.9s ease forwards;
+    animation-delay: 4.45s;
+    margin-top: 0.5rem;
+}
+
+.login-form label {
+    display: block;
+    margin-bottom: 0;
+    font-size: 1.1rem;
+    font-weight: bolder;
+    color: var(--blue);
+}
+
+.login-form input {
+    width: 100%;
+    padding: 12px;
+    border-radius: 6px;
+    border: 1px solid var(--muted);
+    background: linear-gradient(135deg, #000000, #0a1a3f);
+    color: var(--white);
+    margin-top: 0.8em;
+    margin-bottom: 1em;
+    outline: none;
+}
+
+.login-form input::placeholder {
+    color: var(--muted);
+}
+
+.login-form button {
+    display: block;
+    margin: 1em auto 0 auto;
+    background: var(--line);
+    color: var(--white);
+    padding: 12px 20px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    width: 100%;
+    font-weight: bold;
+    transition: transform 0.2s ease, opacity 0.2s ease;
+}
+
+.login-form button:hover {
+    transform: translateY(-1px);
+    opacity: 0.95;
+}
+
+@keyframes loginTyping {
+    to {
+        width: 100%;
+    }
+}
+
+@keyframes loginFadeSlide {
+    to {
+        opacity: 1;
+        transform: translateX(0);
     }
 }
