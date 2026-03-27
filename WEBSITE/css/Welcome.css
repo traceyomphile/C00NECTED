@@ -7,7 +7,7 @@
 
 :root {
     --bg: linear-gradient(135deg, #000000, #0a1a3f);
-    --line: rgb(113, 124, 205);
+    --line: rgb(15, 27, 123);
     --blue: rgb(113, 124, 205);
     --white: #f4f6fb;
     --muted: #8894aa;
@@ -23,17 +23,18 @@ body {
     letter-spacing: 1px;
 }
 
-/* Whole screen */
+/* Default: small = vertical split*/
 .app {
-    width: 200vw;
+    width: 100vw;
     height: 100vh;
     display: flex;
+    flex-direction: column;
     overflow: hidden;
 }
 
 
 .panel {
-    height: 100vh;
+    width: 100vw;
     overflow: hidden;
     transition:
         width 1.2s ease-in-out,
@@ -51,32 +52,81 @@ body {
     width: 100vw;
     height: 100vh;
     opacity: 1;
-    transform: translateX(0);
+    transform: translateY(0);
     text-align: center;
 }
 
 /* Login panel starts hidden on the right, then fades/slides in */
 .login-panel {
-    width: 0;
+    width: 100vw;
+    height: 0;
     opacity: 0;
-    transform: translateX(80px);
+    transform: translateY(80px);
     pointer-events: none;
 }
 
 /* After 4 seconds: show half welcome + half login */
 body.show-login .welcome-panel {
-    width: 50vw;
+    height: 40vh;
 }
 
-body.show-login .logo,
-body.show-login .logo .zero {
-    font-size: 15cqw;
+body.show-login .login-panel {
+    height: 50vh;
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
 }
 
-body.show-login .tagline {
-    font-size: 8cqw;
-}
+/* Bigger than 390x844 = horizontal split */
+@media (min-width: 391px) {
+    .app {
+        width: 100vw;
+        height: 100vh;
+        display: flex;
+        flex-direction: row;
+        overflow: hidden;
+    }
 
+    .panel {
+        height: 100vh;
+        overflow: hidden;
+        transition:
+            width 1.2s ease-in-out,
+            opacity 1s ease-in-out,
+            transform 1s ease-in-out;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        padding: 2rem;
+        container-type: inline-size;
+    }
+
+    .welcome-panel {
+        width: 100vw;
+        height: 100vh;
+        opacity: 1;
+        transform: translateX(0);
+        text-align: center;
+    }
+
+    .login-panel {
+        width: 100vw;
+        height: 0;
+        opacity: 0;
+        transform: translateX(80px);
+        pointer-events: none;
+    }
+
+    .body.show-login .welcome-panel {
+        width: 50vw;
+    }
+
+    .body.show-login .login-panel {
+        width: 50vw;
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
 
 /* Welcome content shrinks/moves a bit when login appears */
 .hero {
@@ -93,7 +143,7 @@ body.show-login .hero {
 .logo {
     overflow: hidden;
     white-space: nowrap;
-    border-right: 0px solid black;
+    border-right: 0px transparent black;
     width: 0;
     animation: typing 2s steps(20, end) forwards;
 
@@ -126,7 +176,6 @@ body.show-login .hero {
     font-style: italic;
     opacity: 0;
     transform: translateX(20px);
-
     animation: fadeSlide 1s ease forwards;
     animation-delay: 2s;
 
@@ -139,6 +188,16 @@ body.show-login .hero {
 
 .tagline .sep {
     color: #6b778f;
+}
+
+/* When spli happens, scale the text to the visible half */
+body.show-login .logo,
+body.show-login .logo .zero {
+    font-size: 15cqw;
+}
+
+body.show-login .tagline {
+    font-size: 8cqw;
 }
 
 .dots {
@@ -154,6 +213,7 @@ body.show-login .hero {
     border-radius: 50%;
     background: var(--blue);
     opacity: 0;
+    margin-bottom: 0.5rem;
     animation: pulse 1.3s infinite ease-in-out;
     animation-delay: 3s;
 }
@@ -191,20 +251,27 @@ body.show-login .hero {
     }
 }
 
-body.show-login .login-panel {
-    width: 50vw;
-    opacity: 1;
-    transform: translateX(0);
-    pointer-events: auto;
-}
-
 .login-wrapper {
     width: min(420px, 90%);
-    padding: 2rem;
+    padding: 1.5rem;
     border: 1px solid rgba(113, 124, 205, 0.35);
     border-radius: 18px;
     background: rgba(0, 0, 0, 0.22);
     box-shadow: 0 0 24px rgba(47, 121, 255, 0.12);
+}
+
+@media (max-width: 390px) {
+    .panel {
+        padding: 1rem;
+    }
+
+    .login-wrapper {
+        padding: 1.25rem;
+    }
+
+    .login-title {
+        font-size: clamp(1.8rem, 8vw, 3rem);
+    }
 }
 
 .login-title {
