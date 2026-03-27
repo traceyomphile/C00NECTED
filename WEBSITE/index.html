@@ -5,29 +5,153 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>C00NECTED</title>
-    <link rel="stylesheet" href="css/Welcome.css">
-
+    <link rel="stylesheet" href="css/welcome.css">
 </head>
 
 <body>
-    <main class="hero">
-        <h1 class="logo" aria-label="C00NECTED">
-            <span>C</span><span class="zero">00</span><span>NECTED</span>
-        </h1>
+    <div class="app">
+        <!-- LEFT / TOP PANEL -->
+        <section class="panel welcome-panel">
+            <main class="hero">
+                <h1 class="logo">
+                    <span>C</span><span class="zero">00</span><span>NECTED</span>
+                </h1>
 
-        <div class="divider"></div>
+                <div class="divider"></div>
 
-        <p class="tagline">
-            connect <span class="sep">•</span> chat <span class="sep">•</span> call
-        </p>
+                <p class="tagline">
+                    connect <span class="sep">•</span> chat <span class="sep">•</span> call
+                </p>
 
-        <div class="dots" aria-label="loading animation">
-            <span class="dot"></span>
-            <span class="dot"></span>
-            <span class="dot"></span>
-        </div>
-    </main>
-    
+                <div class="dots">
+                    <span class="dot"></span>
+                    <span class="dot"></span>
+                    <span class="dot"></span>
+                </div>
+            </main>
+        </section>
+
+        <!-- RIGHT / BOTTOM PANEL -->
+        <section class="panel auth-panel">
+            <div class="auth-container">
+
+                <!-- LOGIN CARD -->
+                <main class="auth-card login-card active">
+                    <h1 class="auth-title">LOGIN</h1>
+
+                    <form id="loginForm" class="auth-form">
+                        <label for="loginUsername">Username</label>
+                        <input type="text" id="loginUsername" placeholder="username" required>
+
+                        <label for="loginPassword">Password</label>
+                        <input type="password" id="loginPassword" placeholder="*********" required>
+
+                        <button type="submit">LOGIN</button>
+                        <button type="button" id="showSignupBtn">SIGNUP</button>
+                    </form>
+                </main>
+
+                <!-- SIGNUP CARD -->
+                <main class="auth-card signup-card">
+                    <h1 class="auth-title">SIGN UP</h1>
+
+                    <form id="signupForm" class="auth-form">
+                        <label for="signupUsername">Username</label>
+                        <input type="text" id="signupUsername" placeholder="enter username" required>
+
+                        <label for="sinupEmail">Email</label>
+                        <input type="email" id="signupEmail" placeholder="email@example.com" required>
+
+                        <label for="signupPassword">Password</label>
+                        <input type="password" id="signupPassword" placeholder="create password" required>
+
+                        <label for="confirmPassword">Confirm Pasword</label>
+                        <input type="password" id="confirmPassword" placeholder="confirm password" required>
+
+                        <button type="submit">REGISTER</button>
+                        <button type="button" id="backToLoginBtn">BACK TO LOGIN</button>
+                    </form>
+                </main>
+
+            </div>
+        </section>
+    </div>
+
+    <script>
+        const body = document.body;
+
+        const showSignupBtn = document.getElementById("showSignupBtn");
+        const backToLoginBtn = document.getElementById("backToLoginBtn");
+
+        const loginCard = document.querySelector(".login-card");
+        const signupCard = document.querySelector(".signup-card");
+
+        const signupForm = document.getElementById("signupForm");
+        const successPopup = document.getElementById("successPopup");
+
+        window.addEventListener("load", () => {
+            setTimeout(() => {
+                body.classList.add("show-login");
+            }, 4000);
+        });
+
+        showSignupBtn.addEventListener("click", () => {
+            loginCard.classList.remove("active");
+            signupCard.classList.add("active");
+        });
+
+        backToLoginBtn.addEventListener("click", () => {
+            signupCard.classList.remove("active");
+            loginCard.classList.add("active");
+        });
+
+        function showPopup(title, message) {
+            successPopup.querySelector("h2").textContent = title;
+            successPopup.querySelector("p").textContent = message;
+            successPopup.classList.add("show");
+        }
+
+        function hidePopup() {
+            successPopup.classList.remove("show");
+        }
+
+        signupForm.addEventListener("submit", (event) => {
+            event.preventDefault();
+
+            const username = document.getElementById("signupUsername").value.trim();
+            const email = document.getElementById("signupEmail").value.trim();
+            const password = document.getElementById("signupPassword").value;
+            const confirmPassword = document.getElementById("confirmPassword").value;
+
+            if (username === "" || email === "" || password === "" || confirmPassword === "") {
+                showPopup("Missing Fields", "Please fill in all fields.");
+                setTimeout(hidePopup, 1500);
+                return;
+            }
+
+            if (password !== confirmPassword) {
+                showPopup("Password Error", "Passwords do not match.");
+                setTimeout(hidePopup, 1500);
+                return;
+            }
+
+            showPopup("Success", "Registration completed successfully!");
+
+            setTimeout(() => {
+                hidePopup();
+                signupForm.reset();
+                signupCard.classList.remove("active");
+                loginCard.classList.add("active");
+            }, 1800);
+        });
+    </script>
+
+    <div id="popup" class="popup-overlay">
+    <div class="popup-box">
+        <h2 id="popupTitle">Success</h2>
+        <p id="popupMessage">Registration completed successfully.</p>
+    </div>
+</div>
 </body>
 </html>
 
