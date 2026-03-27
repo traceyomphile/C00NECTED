@@ -80,51 +80,38 @@ body.show-login .login-panel {
 /* Bigger than 390x844 = horizontal split */
 @media (min-width: 391px) {
     .app {
-        width: 100vw;
-        height: 100vh;
-        display: flex;
         flex-direction: row;
-        overflow: hidden;
     }
 
     .panel {
         height: 100vh;
-        overflow: hidden;
-        transition:
-            width 1.2s ease-in-out,
-            opacity 1s ease-in-out,
-            transform 1s ease-in-out;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        padding: 2rem;
-        container-type: inline-size;
     }
 
     .welcome-panel {
         width: 100vw;
         height: 100vh;
-        opacity: 1;
         transform: translateX(0);
-        text-align: center;
     }
 
     .login-panel {
-        width: 100vw;
-        height: 0;
+        width: 0;
+        height: 100vh;
         opacity: 0;
         transform: translateX(80px);
         pointer-events: none;
     }
 
-    .body.show-login .welcome-panel {
+    body.show-login .welcome-panel {
         width: 50vw;
+        height: 100vh;
     }
 
-    .body.show-login .login-panel {
+    body.show-login .login-panel {
         width: 50vw;
+        height: 100vh;
         opacity: 1;
         transform: translateX(0);
+        pointer-events: auto;
     }
 }
 
@@ -143,7 +130,7 @@ body.show-login .hero {
 .logo {
     overflow: hidden;
     white-space: nowrap;
-    border-right: 0px transparent black;
+    border-right: 0px transparent;
     width: 0;
     animation: typing 2s steps(20, end) forwards;
 
@@ -159,7 +146,7 @@ body.show-login .hero {
     font-size: 14vw;
     font-weight: 900;
     font-style: oblique;
-    color: var(--blue);
+    color: var(--line);
     letter-spacing: 1px;
 }
 
@@ -190,7 +177,7 @@ body.show-login .hero {
     color: #6b778f;
 }
 
-/* When spli happens, scale the text to the visible half */
+/* When split happens, scale the text to the visible half */
 body.show-login .logo,
 body.show-login .logo .zero {
     font-size: 15cqw;
@@ -211,7 +198,7 @@ body.show-login .tagline {
     width: 14px;
     height: 14px;
     border-radius: 50%;
-    background: var(--blue);
+    background: var(--line);
     opacity: 0;
     margin-bottom: 0.5rem;
     animation: pulse 1.3s infinite ease-in-out;
