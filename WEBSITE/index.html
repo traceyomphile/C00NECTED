@@ -59,7 +59,7 @@
                         <label for="signupUsername">Username</label>
                         <input type="text" id="signupUsername" placeholder="enter username" required>
 
-                        <label for="sinupEmail">Email</label>
+                        <label for="signupEmail">Email</label>
                         <input type="email" id="signupEmail" placeholder="email@example.com" required>
 
                         <label for="signupPassword">Password</label>
@@ -77,6 +77,12 @@
         </section>
     </div>
 
+    <div id="popup" class="popup-overlay">
+    <div class="popup-box">
+        <h2 id="popupTitle">Success</h2>
+        <p id="popupMessage">Registration completed successfully.</p>
+    </div>
+
     <script>
         const body = document.body;
 
@@ -87,7 +93,7 @@
         const signupCard = document.querySelector(".signup-card");
 
         const signupForm = document.getElementById("signupForm");
-        const successPopup = document.getElementById("successPopup");
+        const successPopup = document.getElementById("popup");
 
         window.addEventListener("load", () => {
             setTimeout(() => {
